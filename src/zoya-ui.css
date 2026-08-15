@@ -1,0 +1,1125 @@
+/* =========================================================
+   ZOYA UI
+   ========================================================= */
+
+:root {
+  --zoya-theme: #ec4899;
+  --zoya-bg: #050507;
+  --zoya-panel: rgba(12, 12, 18, 0.88);
+  --zoya-border: rgba(255, 255, 255, 0.09);
+  --zoya-text: #f8fafc;
+  --zoya-muted: #94a3b8;
+}
+
+
+/* =========================================================
+   GLOBAL
+   ========================================================= */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  background: var(--zoya-bg);
+  color: var(--zoya-text);
+  font-family:
+    Inter,
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+}
+
+
+/* =========================================================
+   MAIN SCREEN
+   ========================================================= */
+
+.zoya-screen {
+  position: relative;
+
+  width: 100%;
+  height: 100vh;
+
+  display: flex;
+  flex-direction: column;
+
+  overflow: hidden;
+
+  background:
+    radial-gradient(
+      circle at 35% 35%,
+      color-mix(
+        in srgb,
+        var(--zoya-theme) 14%,
+        transparent
+      ),
+      transparent 42%
+    ),
+    radial-gradient(
+      circle at 80% 70%,
+      rgba(30, 41, 59, 0.25),
+      transparent 40%
+    ),
+    #050507;
+}
+
+
+/* =========================================================
+   TOP BAR
+   ========================================================= */
+
+.zoya-topbar {
+  position: relative;
+  z-index: 20;
+
+  height: 70px;
+  min-height: 70px;
+
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+
+  padding: 0 32px;
+
+  border-bottom: 1px solid var(--zoya-border);
+
+  background: rgba(5, 5, 7, 0.72);
+
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+}
+
+.zoya-logo {
+  font-size: 25px;
+  font-weight: 800;
+  letter-spacing: 0.22em;
+
+  color: white;
+
+  text-shadow:
+    0 0 20px
+    color-mix(
+      in srgb,
+      var(--zoya-theme) 55%,
+      transparent
+    );
+}
+
+.zoya-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+
+  color: var(--zoya-muted);
+
+  font-size: 11px;
+  font-weight: 700;
+
+  letter-spacing: 0.14em;
+}
+
+.zoya-status-dot {
+  width: 7px;
+  height: 7px;
+
+  border-radius: 50%;
+
+  background: #64748b;
+}
+
+.zoya-status-dot.online {
+  background: #22c55e;
+
+  box-shadow:
+    0 0 8px rgba(34, 197, 94, 0.8),
+    0 0 16px rgba(34, 197, 94, 0.4);
+}
+
+
+/* =========================================================
+   MAIN LAYOUT
+   ========================================================= */
+
+.zoya-main {
+  position: relative;
+  z-index: 5;
+
+  flex: 1;
+
+  min-height: 0;
+
+  display: grid;
+
+  grid-template-columns:
+    minmax(0, 1fr)
+    minmax(330px, 390px);
+
+  gap: 18px;
+
+  padding: 18px;
+
+  overflow: hidden;
+}
+
+
+/* =========================================================
+   ZOYA VISUAL
+   ========================================================= */
+
+.zoya-visual {
+  min-width: 0;
+  min-height: 0;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.zoya-picture-frame {
+  position: relative;
+
+  width: min(100%, 760px);
+  height: 100%;
+
+  min-height: 500px;
+
+  overflow: hidden;
+
+  border-radius: 30px;
+
+  border: 1px solid var(--zoya-border);
+
+  background: #09090d;
+
+  box-shadow:
+    0 30px 80px rgba(0, 0, 0, 0.45),
+    0 0 70px
+      color-mix(
+        in srgb,
+        var(--zoya-theme) 12%,
+        transparent
+      );
+}
+
+.zoya-main-image {
+  width: 100%;
+  height: 100%;
+
+  display: block;
+
+  object-fit: cover;
+
+  object-position: center;
+
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+
+/* =========================================================
+   IMAGE OVERLAY
+   ========================================================= */
+
+.zoya-image-overlay {
+  position: absolute;
+  inset: 0;
+
+  pointer-events: none;
+
+  background:
+    linear-gradient(
+      to bottom,
+      rgba(0, 0, 0, 0.08),
+      transparent 35%,
+      rgba(0, 0, 0, 0.5)
+    );
+}
+
+
+/* =========================================================
+   SPEAKING STATUS
+   ========================================================= */
+
+.zoya-speaking-status {
+  position: absolute;
+
+  left: 50%;
+  bottom: 145px;
+
+  transform: translateX(-50%);
+
+  width: min(80%, 400px);
+
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 9px;
+
+  pointer-events: none;
+}
+
+.zoya-wave {
+  height: 35px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  gap: 3px;
+}
+
+.zoya-wave span {
+  width: 3px;
+
+  border-radius: 999px;
+
+  background: var(--zoya-theme);
+
+  box-shadow:
+    0 0 7px
+      color-mix(
+        in srgb,
+        var(--zoya-theme) 75%,
+        transparent
+      );
+
+  animation: zoya-wave 0.8s
+    ease-in-out infinite alternate;
+}
+
+.zoya-wave span:nth-child(2n) {
+  animation-delay: 0.08s;
+}
+
+.zoya-wave span:nth-child(3n) {
+  animation-delay: 0.16s;
+}
+
+.zoya-wave span:nth-child(4n) {
+  animation-delay: 0.24s;
+}
+
+.zoya-wave.idle span {
+  animation: none;
+
+  opacity: 0.45;
+}
+
+@keyframes zoya-wave {
+  from {
+    transform: scaleY(0.45);
+  }
+
+  to {
+    transform: scaleY(1.35);
+  }
+}
+
+.zoya-listening-text {
+  color: rgba(255, 255, 255, 0.85);
+
+  font-size: 12px;
+  font-weight: 600;
+
+  letter-spacing: 0.08em;
+
+  text-transform: uppercase;
+
+  text-shadow:
+    0 2px 10px rgba(0, 0, 0, 0.7);
+}
+
+
+/* =========================================================
+   CONTROL BUTTONS
+   ========================================================= */
+
+.zoya-controls {
+  position: absolute;
+
+  left: 50%;
+  bottom: 42px;
+
+  transform: translateX(-50%);
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  gap: 22px;
+}
+
+.zoya-control,
+.zoya-power {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+
+  color: white;
+
+  cursor: pointer;
+
+  transition:
+    transform 0.2s ease,
+    background 0.2s ease,
+    border-color 0.2s ease,
+    box-shadow 0.2s ease;
+}
+
+.zoya-control {
+  width: 70px;
+  height: 62px;
+
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+
+  gap: 5px;
+
+  border-radius: 18px;
+
+  background: rgba(10, 10, 16, 0.84);
+
+  backdrop-filter: blur(15px);
+}
+
+.zoya-control span {
+  font-size: 9px;
+
+  font-weight: 700;
+
+  letter-spacing: 0.08em;
+
+  color: #cbd5e1;
+}
+
+.zoya-control:hover {
+  transform: translateY(-3px);
+
+  border-color:
+    color-mix(
+      in srgb,
+      var(--zoya-theme) 55%,
+      transparent
+    );
+
+  background:
+    color-mix(
+      in srgb,
+      var(--zoya-theme) 12%,
+      rgba(10, 10, 16, 0.9)
+    );
+
+  box-shadow:
+    0 8px 30px
+      color-mix(
+        in srgb,
+        var(--zoya-theme) 15%,
+        transparent
+      );
+}
+
+.zoya-control.muted {
+  color: #fb7185;
+
+  border-color:
+    rgba(251, 113, 133, 0.35);
+}
+
+.zoya-control.screen-active {
+  color: #60a5fa;
+
+  border-color:
+    rgba(96, 165, 250, 0.45);
+
+  background:
+    rgba(30, 64, 175, 0.18);
+}
+
+
+/* =========================================================
+   POWER BUTTON
+   ========================================================= */
+
+.zoya-power {
+  width: 78px;
+  height: 78px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  border-radius: 50%;
+
+  background: rgba(10, 10, 16, 0.92);
+
+  backdrop-filter: blur(15px);
+
+  box-shadow:
+    0 10px 35px rgba(0, 0, 0, 0.45);
+}
+
+.zoya-power:hover {
+  transform: scale(1.06);
+}
+
+.zoya-power.active {
+  color: white;
+
+  border-color:
+    color-mix(
+      in srgb,
+      var(--zoya-theme) 65%,
+      transparent
+    );
+
+  background:
+    color-mix(
+      in srgb,
+      var(--zoya-theme) 20%,
+      rgba(10, 10, 16, 0.9)
+    );
+
+  box-shadow:
+    0 0 25px
+      color-mix(
+        in srgb,
+        var(--zoya-theme) 35%,
+        transparent
+      ),
+    0 10px 40px rgba(0, 0, 0, 0.4);
+}
+
+
+/* =========================================================
+   CHAT PANEL
+   ========================================================= */
+
+.zoya-chat {
+  min-width: 0;
+  min-height: 0;
+
+  display: flex;
+  flex-direction: column;
+
+  overflow: hidden;
+
+  border: 1px solid var(--zoya-border);
+
+  border-radius: 26px;
+
+  background:
+    linear-gradient(
+      180deg,
+      rgba(16, 16, 23, 0.94),
+      rgba(8, 8, 12, 0.94)
+    );
+
+  box-shadow:
+    0 25px 70px rgba(0, 0, 0, 0.38);
+
+  backdrop-filter: blur(20px);
+}
+
+
+/* =========================================================
+   CHAT HEADER
+   ========================================================= */
+
+.zoya-chat-header {
+  height: 74px;
+  min-height: 74px;
+
+  display: flex;
+  align-items: center;
+
+  gap: 12px;
+
+  padding: 0 18px;
+
+  border-bottom:
+    1px solid var(--zoya-border);
+}
+
+.zoya-chat-avatar {
+  width: 42px;
+  height: 42px;
+
+  overflow: hidden;
+
+  border-radius: 50%;
+
+  border:
+    1px solid
+      color-mix(
+        in srgb,
+        var(--zoya-theme) 45%,
+        transparent
+      );
+}
+
+.zoya-chat-avatar img {
+  width: 100%;
+  height: 100%;
+
+  object-fit: cover;
+}
+
+.zoya-chat-name {
+  color: white;
+
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.zoya-chat-state {
+  display: flex;
+  align-items: center;
+
+  gap: 5px;
+
+  margin-top: 3px;
+
+  color: #64748b;
+
+  font-size: 10px;
+}
+
+.zoya-online-dot,
+.zoya-offline-dot {
+  width: 6px;
+  height: 6px;
+
+  border-radius: 50%;
+}
+
+.zoya-online-dot {
+  background: #22c55e;
+
+  box-shadow:
+    0 0 7px
+      rgba(34, 197, 94, 0.65);
+}
+
+.zoya-offline-dot {
+  background: #64748b;
+}
+
+
+/* =========================================================
+   MESSAGES
+   ========================================================= */
+
+.zoya-messages {
+  flex: 1;
+
+  min-height: 0;
+
+  overflow-y: auto;
+
+  padding: 18px 14px;
+
+  scrollbar-width: thin;
+
+  scrollbar-color:
+    rgba(255, 255, 255, 0.12)
+    transparent;
+}
+
+.zoya-messages::-webkit-scrollbar {
+  width: 5px;
+}
+
+.zoya-messages::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.zoya-messages::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+
+  border-radius: 999px;
+}
+
+
+/* =========================================================
+   EMPTY CHAT
+   ========================================================= */
+
+.zoya-empty-chat {
+  height: 100%;
+
+  display: flex;
+  flex-direction: column;
+
+  align-items: center;
+  justify-content: center;
+
+  text-align: center;
+
+  color: #94a3b8;
+
+  font-size: 13px;
+}
+
+.zoya-empty-chat small {
+  max-width: 200px;
+
+  margin-top: 7px;
+
+  line-height: 1.5;
+
+  color: #475569;
+}
+
+.zoya-empty-icon {
+  margin-bottom: 10px;
+
+  color: var(--zoya-theme);
+
+  font-size: 28px;
+
+  text-shadow:
+    0 0 20px
+      color-mix(
+        in srgb,
+        var(--zoya-theme) 50%,
+        transparent
+      );
+}
+
+
+/* =========================================================
+   MESSAGE ROW
+   ========================================================= */
+
+.zoya-message-row {
+  display: flex;
+
+  width: 100%;
+
+  margin-bottom: 14px;
+}
+
+.zoya-message-row.user {
+  justify-content: flex-end;
+}
+
+.zoya-message-row.zoya {
+  justify-content: flex-start;
+}
+
+
+/* =========================================================
+   SMALL ZOYA AVATAR
+   ========================================================= */
+
+.zoya-small-avatar {
+  flex: 0 0 auto;
+
+  width: 28px;
+  height: 28px;
+
+  margin-right: 8px;
+
+  overflow: hidden;
+
+  border-radius: 50%;
+
+  border:
+    1px solid
+      color-mix(
+        in srgb,
+        var(--zoya-theme) 35%,
+        transparent
+      );
+}
+
+.zoya-small-avatar img {
+  width: 100%;
+  height: 100%;
+
+  object-fit: cover;
+}
+
+
+/* =========================================================
+   MESSAGE
+   ========================================================= */
+
+.zoya-message-wrapper {
+  max-width: 82%;
+}
+
+.zoya-message {
+  padding: 10px 13px;
+
+  border-radius: 16px;
+
+  color: #e2e8f0;
+
+  font-size: 13px;
+
+  line-height: 1.55;
+
+  word-break: break-word;
+}
+
+.zoya-message-row.zoya
+  .zoya-message {
+  border:
+    1px solid
+      rgba(255, 255, 255, 0.07);
+
+  background:
+    rgba(255, 255, 255, 0.045);
+
+  border-top-left-radius: 5px;
+}
+
+.zoya-message-row.user
+  .zoya-message {
+  color: white;
+
+  background:
+    color-mix(
+      in srgb,
+      var(--zoya-theme) 25%,
+      rgba(20, 20, 28, 0.85)
+    );
+
+  border:
+    1px solid
+      color-mix(
+        in srgb,
+        var(--zoya-theme) 25%,
+        transparent
+      );
+
+  border-top-right-radius: 5px;
+}
+
+
+/* =========================================================
+   MESSAGE META
+   ========================================================= */
+
+.zoya-message-meta {
+  display: flex;
+
+  align-items: center;
+
+  justify-content: flex-end;
+
+  gap: 7px;
+
+  margin-top: 4px;
+
+  padding: 0 3px;
+
+  color: #475569;
+
+  font-size: 9px;
+}
+
+.zoya-message-meta button {
+  width: 20px;
+  height: 20px;
+
+  display: flex;
+
+  align-items: center;
+  justify-content: center;
+
+  border: 0;
+
+  border-radius: 6px;
+
+  color: #64748b;
+
+  background: transparent;
+
+  cursor: pointer;
+}
+
+.zoya-message-meta button:hover {
+  color: white;
+
+  background:
+    rgba(255, 255, 255, 0.07);
+}
+
+
+/* =========================================================
+   VOICE PLAYING
+   ========================================================= */
+
+.zoya-voice-playing {
+  display: flex;
+
+  align-items: center;
+
+  gap: 5px;
+
+  margin-top: 7px;
+
+  color: var(--zoya-theme);
+
+  font-size: 9px;
+
+  font-weight: 600;
+}
+
+
+/* =========================================================
+   CHAT INPUT
+   ========================================================= */
+
+.zoya-chat-bottom {
+  padding: 13px;
+
+  border-top:
+    1px solid var(--zoya-border);
+}
+
+.zoya-input-box {
+  display: flex;
+
+  align-items: center;
+
+  gap: 7px;
+
+  padding: 5px 6px 5px 13px;
+
+  border:
+    1px solid
+      rgba(255, 255, 255, 0.09);
+
+  border-radius: 15px;
+
+  background:
+    rgba(255, 255, 255, 0.045);
+
+  transition:
+    border-color 0.2s ease,
+    box-shadow 0.2s ease;
+}
+
+.zoya-input-box:focus-within {
+  border-color:
+    color-mix(
+      in srgb,
+      var(--zoya-theme) 45%,
+      transparent
+    );
+
+  box-shadow:
+    0 0 0 3px
+      color-mix(
+        in srgb,
+        var(--zoya-theme) 8%,
+        transparent
+      );
+}
+
+.zoya-input-box input {
+  flex: 1;
+
+  min-width: 0;
+
+  height: 38px;
+
+  border: 0;
+
+  outline: 0;
+
+  color: white;
+
+  background: transparent;
+
+  font-size: 12px;
+}
+
+.zoya-input-box input::placeholder {
+  color: #475569;
+}
+
+.zoya-input-box button {
+  width: 38px;
+  height: 38px;
+
+  flex: 0 0 auto;
+
+  display: flex;
+
+  align-items: center;
+  justify-content: center;
+
+  border: 0;
+
+  border-radius: 11px;
+
+  color: white;
+
+  background: var(--zoya-theme);
+
+  cursor: pointer;
+
+  transition:
+    transform 0.2s ease,
+    opacity 0.2s ease;
+}
+
+.zoya-input-box button:hover:not(:disabled) {
+  transform: scale(1.05);
+}
+
+.zoya-input-box button:disabled {
+  opacity: 0.25;
+
+  cursor: default;
+}
+
+.zoya-chat-hint {
+  margin-top: 6px;
+
+  padding-left: 4px;
+
+  color: #334155;
+
+  font-size: 9px;
+}
+
+
+/* =========================================================
+   ERROR
+   ========================================================= */
+
+.zoya-error {
+  position: fixed;
+
+  right: 20px;
+  bottom: 20px;
+
+  z-index: 100;
+
+  max-width: 420px;
+
+  display: flex;
+
+  align-items: center;
+
+  gap: 12px;
+
+  padding: 12px 14px;
+
+  border:
+    1px solid
+      rgba(244, 63, 94, 0.35);
+
+  border-radius: 13px;
+
+  color: #fecdd3;
+
+  background:
+    rgba(76, 5, 25, 0.94);
+
+  box-shadow:
+    0 20px 50px
+      rgba(0, 0, 0, 0.45);
+
+  font-size: 11px;
+}
+
+.zoya-error button {
+  display: flex;
+
+  align-items: center;
+  justify-content: center;
+
+  border: 0;
+
+  color: #fda4af;
+
+  background: transparent;
+
+  cursor: pointer;
+}
+
+
+/* =========================================================
+   RESPONSIVE
+   ========================================================= */
+
+@media (max-width: 900px) {
+  .zoya-main {
+    grid-template-columns: 1fr;
+
+    overflow-y: auto;
+  }
+
+  .zoya-picture-frame {
+    height: 65vh;
+
+    min-height: 480px;
+  }
+
+  .zoya-chat {
+    height: 500px;
+
+    min-height: 500px;
+  }
+}
+
+
+@media (max-width: 600px) {
+  .zoya-topbar {
+    height: 58px;
+    min-height: 58px;
+
+    padding: 0 18px;
+  }
+
+  .zoya-logo {
+    font-size: 20px;
+  }
+
+  .zoya-main {
+    padding: 10px;
+
+    gap: 10px;
+  }
+
+  .zoya-picture-frame {
+    min-height: 420px;
+
+    border-radius: 20px;
+  }
+
+  .zoya-controls {
+    gap: 10px;
+
+    bottom: 25px;
+  }
+
+  .zoya-control {
+    width: 60px;
+    height: 56px;
+  }
+
+  .zoya-power {
+    width: 68px;
+    height: 68px;
+  }
+}
