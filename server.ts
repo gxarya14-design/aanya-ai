@@ -582,7 +582,9 @@ wss.on("connection", async (clientWs, req) => {
   async function connectGeminiLive(forceFreshSession = false) {
     const myGeneration = ++sessionGeneration;
     const handleToUse = forceFreshSession ? undefined : latestResumptionHandle;
+    const usedHandleThisAttempt = Boolean(handleToUse);
     let geminiAudioCount = 0;
+    let connectedAt = 0;
 
     console.log(
       `Connecting to Gemini Live session (voice: ${selectedVoice}, ` +
@@ -728,9 +730,10 @@ wss.on("connection", async (clientWs, req) => {
               console.error("Error processing Gemini message:", err);
             }
           },
-          onclose: () => {
+          onclose: (e: any) => {
             if (myGeneration !== sessionGeneration) return; // already replaced, ignore
-            console.log("Gemini Live session closed");
+            const reasonText = String(e?.reason || "");
+            console.log(`Gemini Live session closed | code: ${e?.code} | reason: ${reasonText || "(none given)"}`);
             sessionReady = false;
             if (intentionalClose) {
               if (clientWs.readyState === WebSocket.OPEN) {
@@ -738,6 +741,37 @@ wss.on("connection", async (clientWs, req) => {
               }
               return;
             }
+
+            // Gemini's actual rejection signal for a bad/expired resumption
+            // handle (confirmed from real logs: code 1008, "BidiGenerateContent
+            // session not found") — this can fire before the connection ever
+            // reaches the "successfully connected" line, so timing alone
+            // isn't a reliable way to catch it. Check the real signal directly.
+            const isStaleHandleRejection =
+              usedHandleThisAttempt && (e?.code === 1008 || /session not found/i.test(reasonText));
+
+            if (isStaleHandleRejection) {
+              console.warn(
+                `[SESSION RESUMPTION] Gemini rejected the saved handle (${reasonText || `code ${e?.code}`}). ` +
+                `Clearing it and reconnecting fresh instead of retrying the same handle.`
+              );
+              clearResumptionHandle().then(() => triggerReconnect(myGeneration, true));
+              return;
+            }
+
+            // Fallback: even without this exact wording, a session that used
+            // a handle and died within a couple of seconds is still
+            // suspicious — treat it the same way rather than burning retries.
+            const lifetimeMs = connectedAt > 0 ? Date.now() - connectedAt : -1;
+            if (usedHandleThisAttempt && lifetimeMs >= 0 && lifetimeMs < 3000) {
+              console.warn(
+                `[SESSION RESUMPTION] Session closed after only ${lifetimeMs}ms while resuming — ` +
+                `clearing the handle just in case it's the cause.`
+              );
+              clearResumptionHandle().then(() => triggerReconnect(myGeneration, true));
+              return;
+            }
+
             // Gemini ended this on its own (time/token limits, network blip) —
             // reconnect automatically instead of going silent.
             triggerReconnect(myGeneration);
@@ -765,6 +799,7 @@ wss.on("connection", async (clientWs, req) => {
 
       liveSession = session;
       sessionReady = true;
+      connectedAt = Date.now();
       reconnectAttempts = 0;
       intentionalClose = false;
 
@@ -793,7 +828,7 @@ wss.on("connection", async (clientWs, req) => {
     }
   }
 
-  function triggerReconnect(fromGeneration: number) {
+  function triggerReconnect(fromGeneration: number, forceFresh: boolean = false) {
     if (fromGeneration !== sessionGeneration) return; // stale trigger, ignore
     if (reconnecting) return; // already reconnecting
     if (clientWs.readyState !== WebSocket.OPEN) return; // client is gone
@@ -815,7 +850,7 @@ wss.on("connection", async (clientWs, req) => {
 
     setTimeout(async () => {
       reconnecting = false;
-      await connectGeminiLive();
+      await connectGeminiLive(forceFresh);
     }, 500);
   }
 
