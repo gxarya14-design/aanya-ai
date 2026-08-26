@@ -1,4 +1,4 @@
-import { SessionState, ZoyaVoice, ToolCallEvent } from '../types';
+import { SessionState, ZoyaVoice, ToolCallEvent, ConfirmRequiredEvent } from '../types';
 import { AudioPlayer } from './AudioPlayer';
 import { AudioRecorder } from './AudioRecorder';
 import { ScreenSharer } from './ScreenSharer';
@@ -8,6 +8,9 @@ export interface LiveSessionCallbacks {
   onVolumeChange: (volume: number, isInput: boolean) => void;
   onTextReceived: (text: string, isUser: boolean) => void;
   onToolCall: (event: ToolCallEvent) => void;
+  // FIX (confirm-before-act popup): fires when the server parks a gated tool
+  // call and needs an on-screen Allow/Deny answer before it will run.
+  onConfirmRequired: (event: ConfirmRequiredEvent) => void;
   onError: (error: string) => void;
   onScreenShareChange?: (isSharing: boolean) => void;
 }
@@ -240,11 +243,14 @@ export class LiveSession {
             this.isModelResponding = true;
             this.player?.playChunk(msg.audio);
           } else if (msg.type === 'text' && msg.text) {
+            const isUser = msg.isUser ?? false;
             console.log(`[AI TEXT RECEIVED] Gemini text: "${msg.text}"`);
-            console.log(`[Client] Received text: "${msg.text}"`);
-            console.log(`[LiveSession] onTextReceived("${msg.text}", false)`);
-            this.isModelResponding = true;
-            this.callbacks.onTextReceived(msg.text, false);
+            console.log(`[Client] Received text: "${msg.text}" | isUser: ${isUser}`);
+            console.log(`[LiveSession] onTextReceived("${msg.text}", ${isUser})`);
+            if (!isUser) {
+              this.isModelResponding = true;
+            }
+            this.callbacks.onTextReceived(msg.text, isUser);
           } else if (msg.type === 'interrupted') {
             console.log("[GEMINI TURN STATE] Interrupted event received from server.");
             this.isModelResponding = false;
@@ -255,6 +261,21 @@ export class LiveSession {
             this.isModelResponding = false;
           } else if (msg.type === 'toolCall') {
             this.handleToolCall(msg.id, msg.name, msg.args);
+          } else if (msg.type === 'confirmRequired') {
+            // Server is parking a gated tool call (openWebsite,
+            // openApplication, ...) until the user answers on screen. Just
+            // surface it — respondToConfirmation() below sends the answer
+            // back. If this is a re-prompt for a multi-approval tool,
+            // approvalsSoFar will be higher than last time.
+            console.log(`[TOOL CONFIRM] Server needs approval: ${msg.name} (${msg.approvalsSoFar}/${msg.approvalsNeeded})`);
+            this.callbacks.onConfirmRequired({
+              id: msg.id,
+              name: msg.name,
+              args: msg.args || {},
+              summary: msg.summary || `Run ${msg.name}`,
+              approvalsNeeded: msg.approvalsNeeded,
+              approvalsSoFar: msg.approvalsSoFar
+            });
           } else if (msg.type === 'toolNotify') {
             // Server already executed this itself (createFile/searchWeb/
             // openWebsite) and already responded to Gemini directly — this
@@ -346,6 +367,18 @@ export class LiveSession {
         }));
       }
     }, 400);
+  }
+
+  // FIX (confirm-before-act popup): call this when the user taps Allow/Deny
+  // on a confirmRequired card. If approved but more approvals are still
+  // needed, the server will send another confirmRequired (handled above)
+  // instead of running the tool — it does NOT run after just one call here
+  // unless approvalsNeeded was 1.
+  public respondToConfirmation(id: string, approved: boolean): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      console.log(`[TOOL CONFIRM] Sending user answer for ${id}: ${approved ? 'approved' : 'denied'}`);
+      this.ws.send(JSON.stringify({ type: 'toolConfirmation', id, approved }));
+    }
   }
 
   public setMuted(muted: boolean): void {

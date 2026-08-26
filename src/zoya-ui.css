@@ -1123,3 +1123,244 @@ body {
     height: 68px;
   }
 }
+
+/* =========================================================
+   CONFIRMATION POPUP (allow / deny before a risky action)
+   ========================================================= */
+
+.zoya-confirm-overlay {
+  position: fixed;
+
+  inset: 0;
+
+  z-index: 200;
+
+  display: flex;
+
+  align-items: center;
+  justify-content: center;
+
+  padding: 20px;
+
+  background: rgba(2, 2, 5, 0.72);
+
+  backdrop-filter: blur(6px);
+}
+
+.zoya-confirm-modal {
+  width: 100%;
+  max-width: 340px;
+
+  padding: 22px 20px 18px;
+
+  border-radius: 18px;
+
+  border: 1px solid var(--zoya-border);
+
+  background: var(--zoya-panel);
+
+  text-align: center;
+
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+
+.zoya-confirm-icon {
+  display: flex;
+
+  align-items: center;
+  justify-content: center;
+
+  width: 44px;
+  height: 44px;
+
+  margin: 0 auto 12px;
+
+  border-radius: 50%;
+
+  color: var(--zoya-theme);
+
+  background:
+    color-mix(
+      in srgb,
+      var(--zoya-theme) 16%,
+      transparent
+    );
+}
+
+.zoya-confirm-title {
+  margin-bottom: 5px;
+
+  color: var(--zoya-text);
+
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.zoya-confirm-subtext {
+  color: var(--zoya-muted);
+
+  font-size: 12px;
+
+  line-height: 1.5;
+}
+
+.zoya-confirm-progress {
+  margin-top: 10px;
+  padding: 7px 10px;
+
+  border-radius: 10px;
+
+  background: rgba(255, 255, 255, 0.05);
+
+  color: var(--zoya-muted);
+
+  font-size: 11px;
+
+  line-height: 1.5;
+}
+
+.zoya-confirm-actions {
+  display: flex;
+
+  gap: 10px;
+
+  margin-top: 18px;
+}
+
+.zoya-confirm-actions button {
+  flex: 1;
+
+  padding: 11px 0;
+
+  border-radius: 12px;
+
+  font-size: 13px;
+  font-weight: 600;
+
+  cursor: pointer;
+}
+
+.zoya-confirm-deny {
+  border: 1px solid var(--zoya-border);
+
+  color: var(--zoya-muted);
+
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.zoya-confirm-deny:hover {
+  color: var(--zoya-text);
+
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.zoya-confirm-allow {
+  border: 1px solid transparent;
+
+  color: white;
+
+  background: var(--zoya-theme);
+}
+
+.zoya-confirm-allow:hover {
+  background:
+    color-mix(
+      in srgb,
+      var(--zoya-theme) 85%,
+      white
+    );
+}
+
+
+/* =========================================================
+   CODE BLOCK (inside chat messages)
+   ========================================================= */
+
+.zoya-message-text {
+  white-space: pre-wrap;
+}
+
+.zoya-code-block {
+  display: block;
+
+  margin: 8px 0;
+
+  overflow: hidden;
+
+  border-radius: 10px;
+
+  border: 1px solid rgba(255, 255, 255, 0.08);
+
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.zoya-code-block:first-child {
+  margin-top: 0;
+}
+
+.zoya-code-block:last-child {
+  margin-bottom: 0;
+}
+
+.zoya-code-header {
+  display: flex;
+
+  align-items: center;
+  justify-content: space-between;
+
+  padding: 6px 10px;
+
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.zoya-code-lang {
+  color: var(--zoya-muted);
+
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.zoya-code-header button {
+  display: flex;
+
+  align-items: center;
+  justify-content: center;
+
+  width: 20px;
+  height: 20px;
+
+  border: 0;
+
+  border-radius: 6px;
+
+  color: #64748b;
+
+  background: transparent;
+
+  cursor: pointer;
+}
+
+.zoya-code-header button:hover {
+  color: white;
+
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.zoya-code-pre {
+  margin: 0;
+  padding: 10px 13px;
+
+  overflow-x: auto;
+
+  color: #e2e8f0;
+
+  font-family:
+    "SFMono-Regular", Consolas,
+    "Liberation Mono", Menlo, monospace;
+
+  font-size: 12px;
+  line-height: 1.6;
+}

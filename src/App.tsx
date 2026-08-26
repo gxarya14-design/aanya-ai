@@ -10,6 +10,7 @@ import {
   Volume2,
   X,
   AlertCircle,
+  ShieldAlert,
 } from "lucide-react";
 
 import {
@@ -18,6 +19,7 @@ import {
   ZoyaMood,
   ToolCallEvent,
   TranscriptItem,
+  ConfirmRequiredEvent,
 } from "./types";
 
 import { LiveSession } from "./services/LiveSession";
@@ -25,6 +27,66 @@ import { LiveSession } from "./services/LiveSession";
 import zoyaAvatar from "./assets/zoya-avatar.jpg";
 
 import "./zoya-ui.css";
+
+// FIX (voice allow/deny): word lists checked against a user speech chunk
+// while a confirmation popup is pending. Kept loose/casual (Hinglish
+// included) rather than exact phrases, since this is spoken conversation,
+// not typed commands. \b word boundaries stop "allow" from matching inside
+// an unrelated longer word.
+//
+// FIX (voice allow not triggering on full sentences): the original deny/
+// allow lists only matched "kar do" as two separate words (or "kardo"
+// joined), but NOT "karo" -- a different, extremely common inflection of
+// the same verb. "play karo", "video play karo", "chalu karo" all use
+// "karo", not "kar do", so a whole natural sentence like "video play karo"
+// was silently failing to match at all. Widened to alternation covering
+// the actual range of ways someone says yes/no in Hindi/Hinglish, so a
+// bare "haan", a short "haan karo", and a full "video play karo" all match
+// the same way.
+const CONFIRM_ALLOW_WORDS =
+  /\b(allow|confirm|yes|yeah|yep|sure|ok|okay|haan|haa|kar\s*do|karo|kardo|chalu\s*karo|chalao|chala\s*do|play\s*karo)\b/i;
+
+const CONFIRM_DENY_WORDS =
+  /\b(deny|denied|cancel|no|nope|nahi|mat\s*karo|matt\s*karo|rehne\s*do|ruk\s*jao|band\s*karo|rok\s*do)\b/i;
+
+/**
+ * Checks a single speech chunk for an allow/deny voice command.
+ * Returns true (allow), false (deny), or null (no match / ambiguous).
+ *
+ * FIX (a spoken "mat karo" / "cancel kar do" was flipping to ALLOW): the
+ * ALLOW list includes bare "karo"/"kar do" so full sentences like "video
+ * play karo" match — but "karo"/"kar do" are also the tail end of common
+ * DENY phrases ("mat karo", "cancel kar do", "band karo", "rok do"). The
+ * old logic picked whichever match sat later in the text, so in "mat
+ * karo" the ALLOW-list "karo" (sitting after "mat") beat the DENY-list
+ * "mat karo", silently approving an action the user was trying to
+ * decline. DENY is now checked FIRST and wins outright whenever any deny
+ * phrase is present at all — position no longer matters for that case.
+ * ALLOW is only checked when no deny phrase is found, which still covers
+ * "haan", "allow", and full sentences like "video play karo" normally
+ * (none of those contain a deny word to begin with).
+ */
+function matchConfirmationVoiceCommand(
+  text: string
+): boolean | null {
+  const denyMatch = [...text.matchAll(
+    new RegExp(CONFIRM_DENY_WORDS, "gi")
+  )].pop();
+
+  if (denyMatch) {
+    return false;
+  }
+
+  const allowMatch = [...text.matchAll(
+    new RegExp(CONFIRM_ALLOW_WORDS, "gi")
+  )].pop();
+
+  if (allowMatch) {
+    return true;
+  }
+
+  return null;
+}
 
 export default function App() {
   const [sessionState, setSessionState] =
@@ -38,6 +100,24 @@ export default function App() {
 
   const [toolEvent, setToolEvent] =
     useState<ToolCallEvent | null>(null);
+
+  // FIX (confirm-before-act popup): the gated tool call currently waiting on
+  // an Allow/Deny answer, if any. Only one shown at a time — if a second
+  // confirmRequired arrives before this one is answered, it replaces this
+  // (the server still remembers the first one; it just won't be on screen).
+  const [pendingConfirmation, setPendingConfirmation] =
+    useState<ConfirmRequiredEvent | null>(null);
+
+  // FIX (voice allow/deny): mirrors pendingConfirmation so the
+  // onTextReceived callback below — created once when the session is set up
+  // — can always read the *current* pending confirmation instead of the
+  // stale null it would see if it captured the state value directly.
+  const pendingConfirmationRef =
+    useRef<ConfirmRequiredEvent | null>(null);
+
+  useEffect(() => {
+    pendingConfirmationRef.current = pendingConfirmation;
+  }, [pendingConfirmation]);
 
   const [transcripts, setTranscripts] =
     useState<TranscriptItem[]>([]);
@@ -117,6 +197,47 @@ export default function App() {
             return;
           }
 
+          // FIX (voice allow/deny): while a confirmation popup is on
+          // screen, let the user answer it by voice instead of only by
+          // clicking. Checked on every user speech chunk (Gemini streams
+          // transcripts in pieces), so short words like "allow" or "haan"
+          // are almost always caught in the chunk they arrive in. Uses the
+          // ref (not the pendingConfirmation state) because this whole
+          // callback object is created once on mount and would otherwise
+          // only ever see the initial null value.
+          if (isUser && pendingConfirmationRef.current) {
+            // DEBUG (voice allow not firing): logs every user speech chunk
+            // that arrives while a confirmation is pending, and whether it
+            // matched allow/deny. If this never logs at all while testing,
+            // user speech isn't reaching onTextReceived as isUser:true
+            // during the confirmation wait (a mic/transcription issue, not
+            // a matching-logic issue). If it logs but "matched: null" every
+            // time, the transcript text itself isn't hitting the regex —
+            // paste what it prints so the word list can be widened further.
+            console.log('[VOICE CONFIRM DEBUG] chunk while pending:', JSON.stringify(text), '| matched:', matchConfirmationVoiceCommand(text));
+
+            const matchedApproval =
+              matchConfirmationVoiceCommand(text);
+
+            if (matchedApproval !== null) {
+              const confirmationId =
+                pendingConfirmationRef.current.id;
+
+              sessionRef.current?.respondToConfirmation(
+                confirmationId,
+                matchedApproval
+              );
+
+              pendingConfirmationRef.current = null;
+              setPendingConfirmation(null);
+
+              // Still show what the user said in the transcript below,
+              // same as any other utterance — just don't also treat it
+              // as a fresh message for Gemini to respond to in words,
+              // since respondToConfirmation already told the server.
+            }
+          }
+
           setTranscripts((previous) => {
             const now = Date.now();
 
@@ -189,6 +310,15 @@ export default function App() {
               }));
             }
           }
+        },
+
+        onConfirmRequired: (event) => {
+          // Set the ref synchronously here (not just via the
+          // pendingConfirmation useEffect below) so a voice-allow spoken
+          // right as the popup appears is never missed to a state-update
+          // timing race — see the FIX note above onTextReceived.
+          pendingConfirmationRef.current = event;
+          setPendingConfirmation(event);
         },
 
         onError: (error) => {
@@ -373,6 +503,28 @@ export default function App() {
         error
       );
     }
+  };
+
+  /*
+   * ---------------------------------------------------------
+   * CONFIRMATION (allow / deny a gated tool call)
+   * ---------------------------------------------------------
+   */
+
+  const handleConfirmationResponse = (approved: boolean) => {
+    if (!pendingConfirmation || !sessionRef.current) {
+      return;
+    }
+
+    sessionRef.current.respondToConfirmation(
+      pendingConfirmation.id,
+      approved
+    );
+
+    // If more approvals were still needed, the server will send another
+    // confirmRequired shortly and this will be set again — clearing it now
+    // just closes the current card instead of leaving it stuck on stale counts.
+    setPendingConfirmation(null);
   };
 
   /*
@@ -706,6 +858,58 @@ export default function App() {
           </button>
         </div>
       )}
+
+      {/* ---------------------------------------------------
+          CONFIRMATION POPUP (allow / deny a risky action)
+      --------------------------------------------------- */}
+
+      {pendingConfirmation && (
+        <div className="zoya-confirm-overlay">
+          <div className="zoya-confirm-modal">
+            <div className="zoya-confirm-icon">
+              <ShieldAlert size={22} />
+            </div>
+
+            <div className="zoya-confirm-title">
+              {pendingConfirmation.summary}
+            </div>
+
+            <div className="zoya-confirm-subtext">
+              Zoya is asking permission before doing this.
+            </div>
+
+            {pendingConfirmation.approvalsNeeded > 1 && (
+              <div className="zoya-confirm-progress">
+                Confirmed {pendingConfirmation.approvalsSoFar} of{" "}
+                {pendingConfirmation.approvalsNeeded} times —
+                confirm again to continue
+              </div>
+            )}
+
+            <div className="zoya-confirm-actions">
+              <button
+                type="button"
+                className="zoya-confirm-deny"
+                onClick={() =>
+                  handleConfirmationResponse(false)
+                }
+              >
+                Deny
+              </button>
+
+              <button
+                type="button"
+                className="zoya-confirm-allow"
+                onClick={() =>
+                  handleConfirmationResponse(true)
+                }
+              >
+                Allow
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -767,7 +971,10 @@ function ChatMessage({
 
       <div className="zoya-message-wrapper">
         <div className="zoya-message">
-          {message.text}
+          <MessageContent
+            text={message.text}
+            onCopy={onCopy}
+          />
         </div>
 
         <div className="zoya-message-meta">
@@ -786,6 +993,150 @@ function ChatMessage({
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+
+/* =========================================================
+   MESSAGE CONTENT
+   ---------------------------------------------------------
+   FIX (code should show as text in chat): splits a message on
+   ```fenced``` code blocks and renders those as proper code
+   blocks (monospace, own copy button) instead of everything
+   being squashed into one plain paragraph. Runs on the FULL
+   joined message text on every render, so it doesn't matter
+   that Gemini's text arrives in streamed chunks — a fence
+   split across chunks still parses correctly once joined.
+   ========================================================= */
+
+interface MessageContentProps {
+  text: string;
+  onCopy: (text: string) => void;
+}
+
+function MessageContent({
+  text,
+  onCopy,
+}: MessageContentProps) {
+  const parts = splitCodeBlocks(text);
+
+  return (
+    <>
+      {parts.map((part, index) =>
+        part.type === "code" ? (
+          <CodeBlock
+            key={index}
+            language={part.language}
+            code={part.content}
+            onCopy={onCopy}
+          />
+        ) : (
+          <div
+            key={index}
+            className="zoya-message-text"
+          >
+            {part.content}
+          </div>
+        )
+      )}
+    </>
+  );
+}
+
+type MessagePart =
+  | { type: "text"; content: string }
+  | { type: "code"; language: string; content: string };
+
+function splitCodeBlocks(text: string): MessagePart[] {
+  const fenceRegex = /```([a-zA-Z0-9+#._-]*)\n?([\s\S]*?)```/g;
+  const result: MessagePart[] = [];
+
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = fenceRegex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      result.push({
+        type: "text",
+        content: text.slice(lastIndex, match.index),
+      });
+    }
+
+    result.push({
+      type: "code",
+      language: match[1] || "",
+      content: match[2].replace(/\n$/, ""),
+    });
+
+    lastIndex = fenceRegex.lastIndex;
+  }
+
+  if (lastIndex < text.length) {
+    result.push({
+      type: "text",
+      content: text.slice(lastIndex),
+    });
+  }
+
+  if (result.length === 0) {
+    result.push({ type: "text", content: text });
+  }
+
+  return result;
+}
+
+
+/* =========================================================
+   CODE BLOCK
+   ========================================================= */
+
+interface CodeBlockProps {
+  language: string;
+  code: string;
+  onCopy: (text: string) => void;
+}
+
+function CodeBlock({
+  language,
+  code,
+  onCopy,
+}: CodeBlockProps) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    await onCopy(code);
+
+    setCopied(true);
+
+    setTimeout(() => {
+      setCopied(false);
+    }, 1500);
+  };
+
+  return (
+    <div className="zoya-code-block">
+      <div className="zoya-code-header">
+        <span className="zoya-code-lang">
+          {language || "code"}
+        </span>
+
+        <button
+          type="button"
+          onClick={handleCopy}
+          title="Copy code"
+        >
+          {copied ? (
+            <Check size={12} />
+          ) : (
+            <Copy size={12} />
+          )}
+        </button>
+      </div>
+
+      <pre className="zoya-code-pre">
+        <code>{code}</code>
+      </pre>
     </div>
   );
 }

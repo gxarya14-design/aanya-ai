@@ -1,4 +1,4 @@
-import { app, BrowserWindow, desktopCapturer, ipcMain } from 'electron';
+import { app, BrowserWindow, desktopCapturer, ipcMain, shell, screen } from 'electron';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -47,6 +47,54 @@ ipcMain.handle('get-screen-sources', async () => {
   } catch (error) {
     console.error('[ElectronMain] getScreenSources failed:', error);
     return [];
+  }
+});
+
+// FIX (clicks/scroll landing in the wrong place — see the import comment
+// above for the full root cause): gives the renderer the REAL primary
+// display resolution, straight from the OS via Electron's screen module.
+// This is independent of whatever resolution the desktopCapturer stream
+// itself is downscaled to, so ScreenSharer.ts can send the server the
+// correct real size to scale clickAt coordinates against — no more hardcoded
+// or stream-derived guesses.
+ipcMain.handle('get-real-screen-size', () => {
+  try {
+    const primaryDisplay = screen.getPrimaryDisplay();
+    // .size is the display's actual resolution in pixels (not the
+    // DPI-scaled .workAreaSize), which is what real screen coordinates for
+    // mouse.setPosition need to match.
+    return { width: primaryDisplay.size.width, height: primaryDisplay.size.height };
+  } catch (error) {
+    console.error('[ElectronMain] getRealScreenSize failed:', error);
+    return null;
+  }
+});
+
+// FIX (browser window not visibly appearing): server.ts used to shell out
+// to "start <url>" from its own separate Node process, which could open a
+// browser window somewhere the user never saw (a different desktop/session
+// context, or minimized behind the Electron window) or silently fail.
+// shell.openExternal runs inside Electron's own main process and is the
+// OS-native, guaranteed-visible way to open a URL — so the renderer (App.tsx)
+// now asks for this via IPC instead, after server.ts tells it (over the
+// existing WebSocket) which URL to open.
+//
+// Revalidated here (not just trusting the caller) since any renderer script
+// could otherwise invoke this to launch arbitrary protocol handlers.
+ipcMain.handle('open-external-url', async (_event, url) => {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      console.warn(`[ElectronMain] Refused to open non-http(s) URL: ${url}`);
+      return { ok: false, error: 'Only http/https URLs are allowed.' };
+    }
+
+    await shell.openExternal(url);
+    console.log(`[ElectronMain] Opened external URL: ${url}`);
+    return { ok: true };
+  } catch (error) {
+    console.error('[ElectronMain] openExternalUrl failed:', error);
+    return { ok: false, error: String(error?.message || error) };
   }
 });
 

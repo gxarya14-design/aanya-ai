@@ -18,6 +18,20 @@ export class ScreenSharer {
   private onEnded?: () => void;
   private onError?: (errorMsg: string) => void;
 
+  // FIX (clicks/scroll landing in the wrong place): the capture stream is
+  // downscaled to 1280x720 for bandwidth (see the getUserMedia constraints
+  // below), but frame metadata was previously reporting THAT 1280x720 as
+  // "originalWidth/originalHeight" -- the size the server scales clickAt
+  // coordinates UP TO. So every click was scaled to a point somewhere
+  // inside the top-left 1280x720 region of the real screen, never reaching
+  // the rest of a larger monitor (e.g. 1920x1080). Cached here (fetched
+  // once in start(), not re-fetched every captureFrame tick) since the
+  // primary display's resolution doesn't change mid-session and this
+  // requires an IPC round-trip. null means unavailable (browser fallback
+  // mode, or the IPC call failed) -- captureFrame falls back to the video
+  // element's own dimensions in that case, same as the old behavior.
+  private realScreenSize: { width: number; height: number } | null = null;
+
   private isElectron(): boolean {
     return !!window.electronAPI && typeof window.electronAPI.getScreenSources === 'function';
   }
@@ -147,6 +161,27 @@ export class ScreenSharer {
 
       this.active = true;
       this.isRequesting = false;
+
+      // FIX (clicks/scroll landing in the wrong place): fetch the REAL
+      // primary display resolution now, before the first frame goes out,
+      // so clickAt coordinates scale against the actual screen size from
+      // the very first captured frame — not the capture stream's own
+      // (smaller, downscaled) dimensions. Electron-only; browser fallback
+      // mode has no window.electronAPI, so realScreenSize stays null and
+      // captureFrame falls back to the video element's own dimensions.
+      if (this.isElectron() && typeof window.electronAPI?.getRealScreenSize === 'function') {
+        try {
+          const size = await window.electronAPI.getRealScreenSize();
+          if (size && size.width > 0 && size.height > 0) {
+            this.realScreenSize = size;
+            console.log(`[ScreenSharer] Real screen size: ${size.width}x${size.height}`);
+          } else {
+            console.warn('[ScreenSharer] getRealScreenSize returned no usable size — falling back to video element dimensions.');
+          }
+        } catch (error) {
+          console.warn('[ScreenSharer] Failed to fetch real screen size — falling back to video element dimensions:', error);
+        }
+      }
 
       await AudioContextManager.resumeAll();
 
@@ -283,6 +318,29 @@ export class ScreenSharer {
           frameCount: this.frameCount,
           trigger: sourceTrigger,
           capturedTimestamp: now,
+          // FIX (PC-wide click/scroll control): the image Gemini sees is
+          // downscaled to maxDimension (below) to save bandwidth, but any
+          // click Gemini asks for needs to land at the REAL screen
+          // coordinate, not the downscaled one. Sending both sizes here
+          // lets the server work out the scale factor
+          // (originalWidth / scaledWidth) and multiply Gemini's coordinates
+          // back up before actually moving the mouse.
+          //
+          // FIX (clicks/scroll landing in the wrong place): originalWidth/
+          // Height now come from realScreenSize (the actual OS display
+          // resolution, fetched once in start()) instead of the video
+          // element's own videoWidth/videoHeight, which only reflect
+          // whatever resolution the capture stream itself was downscaled
+          // to (1280x720) — a smaller number than most real monitors. That
+          // mismatch was why every click landed inside the top-left
+          // 1280x720 region of the screen instead of the intended target.
+          // Falls back to the video element's dimensions (the old
+          // behavior) when realScreenSize isn't available, e.g. browser
+          // fallback mode with no window.electronAPI.
+          originalWidth: this.realScreenSize?.width ?? width,
+          originalHeight: this.realScreenSize?.height ?? height,
+          scaledWidth: targetWidth,
+          scaledHeight: targetHeight,
           base64Bytes: base64Data.length,
         };
 
@@ -297,6 +355,7 @@ export class ScreenSharer {
     console.log('[ScreenSharer] Stopping screen capture...');
     this.active = false;
     this.isRequesting = false;
+    this.realScreenSize = null;
 
     if (this.workerTicker) {
       this.workerTicker.postMessage({ action: 'stop' });
