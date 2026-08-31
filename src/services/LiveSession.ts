@@ -184,7 +184,15 @@ export class LiveSession {
       (errorMsg) => {
         this.callbacks.onError(errorMsg);
       },
-      3000
+      // FIX (severe reply latency + wrong clicks, caused by stacking this
+      // 1000ms rate on top of MEDIA_RESOLUTION_HIGH + larger 1280px frames
+      // in the same round -- see the matching comment in ScreenSharer.ts's
+      // minFrameIntervalMs for the full explanation): reverted back to
+      // 2000ms. MEDIA_RESOLUTION_HIGH alone already gives Gemini enough
+      // detail per frame for precise clicking -- sending frames twice as
+      // often on top of that was too much combined token volume and made
+      // responses noticeably slower, several seconds behind.
+      2000
     );
 
     if (this.callbacks.onScreenShareChange) {
@@ -289,6 +297,79 @@ export class LiveSession {
               resultMessage: msg.resultMessage
             };
             this.callbacks.onToolCall(event);
+          } else if (msg.type === 'openUrlInElectron' && msg.url) {
+            // FIX (Chrome never visibly opens, even though the terminal log
+            // shows the correct URL): server.ts's openInSystemBrowser() has
+            // ALWAYS sent this message so the Electron renderer can call
+            // shell.openExternal via IPC (see main.js: 'open-external-url',
+            // wired up correctly in preload.cjs) — but this onmessage
+            // handler had NO case for 'openUrlInElectron' at all, so the
+            // message was silently dropped the instant it arrived here.
+            // Nothing downstream of this point ever ran. The server-side
+            // URL generation and its terminal log were always correct;
+            // this was the entire gap.
+            console.log(`[OPEN URL] Received openUrlInElectron for: ${msg.url}`);
+            if (window.electronAPI?.openExternalUrl) {
+              window.electronAPI.openExternalUrl(msg.url).then((result) => {
+                if (!result?.ok) {
+                  console.error(`[OPEN URL] shell.openExternal failed:`, result?.error);
+                  this.callbacks.onError(result?.error || 'Could not open the browser.');
+                } else {
+                  console.log(`[OPEN URL] Successfully opened via Electron: ${msg.url}`);
+                }
+              }).catch((err) => {
+                console.error(`[OPEN URL] IPC call threw:`, err);
+                this.callbacks.onError('Could not open the browser.');
+              });
+            } else {
+              // Not running inside Electron (plain browser tab has no
+              // window.electronAPI at all) — fall back to a normal
+              // browser-native new-tab open instead of silently doing
+              // nothing.
+              console.log('[OPEN URL] No electronAPI bridge — falling back to window.open()');
+              window.open(msg.url, '_blank', 'noopener,noreferrer');
+            }
+          } else if (msg.type === 'openFileInElectron' && msg.path) {
+            // FEATURE (open existing files on the PC by voice): mirrors
+            // openUrlInElectron exactly, but calls openFilePath (shell.
+            // openPath under the hood) instead of openExternalUrl. No
+            // browser-fallback equivalent exists for this one — a plain
+            // browser tab has no filesystem access at all, so this is
+            // Electron-only by nature, not just by the current bridge.
+            console.log(`[OPEN FILE] Received openFileInElectron for: ${msg.path}`);
+            if (window.electronAPI?.openFilePath) {
+              window.electronAPI.openFilePath(msg.path).then((result) => {
+                if (!result?.ok) {
+                  console.error(`[OPEN FILE] shell.openPath failed:`, result?.error);
+                  this.callbacks.onError(result?.error || 'Could not open that file.');
+                } else {
+                  console.log(`[OPEN FILE] Successfully opened via Electron: ${msg.path}`);
+                }
+              }).catch((err) => {
+                console.error(`[OPEN FILE] IPC call threw:`, err);
+                this.callbacks.onError('Could not open that file.');
+              });
+            } else {
+              console.warn('[OPEN FILE] No electronAPI bridge — opening files requires the desktop app.');
+              this.callbacks.onError('Opening files only works in the Zoya desktop app, not in a browser tab.');
+            }
+          } else if (msg.type === 'screenShareControl') {
+            // FEATURE (voice-triggered PC access): server.ts's
+            // handleStartPcAccess/handleStopPcAccess send this when Gemini
+            // decides the user asked for/gave back PC access. Reuses the
+            // exact same toggleScreenShare() the manual Share-Screen button
+            // already calls (see VoiceControls.tsx) -- this just triggers
+            // it from a voice command instead of a click, so the same
+            // onScreenShareChange callback keeps the UI icon in sync either
+            // way. Guarded against the CURRENT state (not blind-toggled):
+            // toggleScreenShare() flips whatever state it's already in, so
+            // if the user says "PC access lo" while sharing is somehow
+            // already on, blindly toggling would incorrectly turn it OFF.
+            const wantsSharing = msg.action === 'start';
+            console.log(`[PC ACCESS] Server requested: ${msg.action}. Currently sharing: ${this.isScreenSharing()}`);
+            if (wantsSharing !== this.isScreenSharing()) {
+              this.toggleScreenShare();
+            }
           } else if (msg.type === 'error') {
             console.error("[LiveSession Debug] Live session error received:", msg.error);
             this.callbacks.onError(msg.error || "Live session error");

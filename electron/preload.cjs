@@ -25,4 +25,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
       return null;
     }
   },
+  // FEATURE (open existing files on the PC, e.g. by voice): mirrors
+  // openExternalUrl exactly, but for local files instead of URLs. Opens
+  // with the OS's default app for that file type -- the same thing that
+  // happens when the user double-clicks it themselves.
+  openFilePath: async (filePath) => {
+    try {
+      return await ipcRenderer.invoke('open-file-path', filePath);
+    } catch (error) {
+      console.error('[Preload] Error opening file path:', error);
+      return { ok: false, error: String(error?.message || error) };
+    }
+  },
 });

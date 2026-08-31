@@ -7,14 +7,14 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import dotenv from "dotenv";
 import { WebSocketServer, WebSocket } from "ws";
-import { GoogleGenAI, LiveServerMessage, Modality, Type, Session } from "@google/genai";
+import { GoogleGenAI, LiveServerMessage, Modality, Type, Session, MediaResolution } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 // FIX (PC-wide click/scroll control): nut.js drives the real OS mouse
 // cursor and keyboard — this is what lets Zoya actually click/type/scroll
 // anywhere on the desktop, not just inside the Electron window. Native
 // bindings, so this only works in the environment it was `npm install`ed
 // in (see the delivery notes).
-import { mouse, keyboard, Point, Button, getWindows, getActiveWindow } from "@nut-tree-fork/nut-js";
+import { mouse, keyboard, Point, Button, getWindows, getActiveWindow, Region } from "@nut-tree-fork/nut-js";
 
 dotenv.config();
 
@@ -268,7 +268,14 @@ function isUsableTargetWindow(title: string | null | undefined): boolean {
     return false;
   }
   const normalized = title.trim().toLowerCase();
-  if (normalized.includes("zoya")) {
+  // FIX: exact match, not substring. Zoya's window title is always
+  // EXACTLY "Zoya" (see main.js + index.html) with nothing dynamic ever
+  // appended to it, so exact match is sufficient to exclude it -- and
+  // unlike a substring check, it won't also wrongly exclude a real browser
+  // window whose title happens to contain "zoya" (e.g. the user searches
+  // "zoya voice assistant" in Chrome). Matches how WINDOW_TITLE_DENYLIST
+  // below is already checked (exact match).
+  if (normalized === "zoya") {
     return false;
   }
   return !WINDOW_TITLE_DENYLIST.some((denied) => normalized === denied);
@@ -295,7 +302,20 @@ function isBrowserWindow(title: string | null | undefined): boolean {
 // is also top-level and needs to call this; it has no dependency on any
 // connection-specific state (like latestFrameResolution) that would
 // require closure scope.
-async function focusTargetWindow(): Promise<string | null> {
+// FIX (scroll landing in the wrong place): this used to return only the
+// window's title. That was enough for clickAt (which already gets an
+// explicit x/y) and typeText (keyboard input follows OS focus, so
+// focusing was genuinely sufficient) -- but never enough for scrollScreen.
+// mouse.scrollUp/Down/Left/Right() send an OS-level scroll-wheel event,
+// which on Windows (and most desktop apps) goes to whichever window is
+// under the MOUSE CURSOR at that instant, not whichever window merely has
+// OS "focus". handleScroll was focusing the right window and then
+// scrolling without ever moving the mouse into it -- so the scroll landed
+// wherever the cursor physically happened to already be sitting. Returning
+// `region` (left/top/width/height) too lets handleScroll move the mouse
+// to that window's center before scrolling. Callers that only need the
+// title (handleClickAt, handleTypeText) just destructure `.title`.
+async function focusTargetWindow(): Promise<{ title: string; region: Region } | null> {
   try {
     const active = await getActiveWindow();
     const activeTitle = await active.title;
@@ -303,7 +323,7 @@ async function focusTargetWindow(): Promise<string | null> {
     // Already focused on a browser -- nothing to do, avoids an
     // unnecessary focus-switch flicker.
     if (isBrowserWindow(activeTitle)) {
-      return activeTitle;
+      return { title: activeTitle, region: await active.region };
     }
 
     const allWindows = await getWindows();
@@ -314,7 +334,7 @@ async function focusTargetWindow(): Promise<string | null> {
       if (isBrowserWindow(title)) {
         await win.focus();
         await new Promise((resolve) => setTimeout(resolve, 150));
-        return title;
+        return { title, region: await win.region };
       }
     }
 
@@ -322,7 +342,7 @@ async function focusTargetWindow(): Promise<string | null> {
     // (e.g. the user asked to interact with some non-browser app) rather
     // than refusing outright.
     if (isUsableTargetWindow(activeTitle)) {
-      return activeTitle;
+      return { title: activeTitle, region: await active.region };
     }
     for (const win of allWindows) {
       const title = await win.title;
@@ -333,7 +353,7 @@ async function focusTargetWindow(): Promise<string | null> {
         // fast-following actions can still land on the window that's
         // mid-transition-out.
         await new Promise((resolve) => setTimeout(resolve, 150));
-        return title;
+        return { title, region: await win.region };
       }
     }
 
@@ -423,18 +443,210 @@ async function handleSearchWeb(call: any, session: Session, clientWs: WebSocket)
   }
 }
 
+// FEATURE (open existing files on the PC by voice — "open my resume",
+// "find that vacation photo"): searches only these common personal
+// folders, not the whole filesystem — fast enough to search on every
+// call, and keeps results relevant to what a user would actually mean by
+// "my file" rather than surfacing something from deep in an unrelated
+// system folder. A folder that doesn't exist on this PC (e.g. no Videos
+// folder) is skipped silently rather than erroring.
+const SEARCHABLE_FOLDERS = ["Desktop", "Downloads", "Documents", "Pictures", "Videos", "Music"].map(
+  (name) => path.join(os.homedir(), name)
+);
+
+async function findFilesByName(query: string, maxResults: number = 8): Promise<string[]> {
+  const matches: string[] = [];
+  const lowerQuery = query.toLowerCase();
+
+  async function scanDir(dir: string, depth: number): Promise<void> {
+    if (matches.length >= maxResults || depth > 2) return;
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return; // Folder doesn't exist or isn't readable — just skip it.
+    }
+    for (const entry of entries) {
+      if (matches.length >= maxResults) return;
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await scanDir(fullPath, depth + 1);
+      } else if (entry.name.toLowerCase().includes(lowerQuery)) {
+        matches.push(fullPath);
+      }
+    }
+  }
+
+  for (const folder of SEARCHABLE_FOLDERS) {
+    await scanDir(folder, 0);
+  }
+
+  return matches;
+}
+
+async function handleFindFile(call: any, session: Session, clientWs: WebSocket) {
+  const query = String(call.args?.query || "").trim();
+  if (!query) {
+    session.sendToolResponse({
+      functionResponses: [{ id: call.id, name: call.name, response: { result: "error", message: "No search text was given." } }]
+    });
+    notifyClient(clientWs, call, `Couldn't search — no query given`);
+    return;
+  }
+
+  console.log(`[FIND FILE] Searching Desktop/Downloads/Documents/Pictures/Videos/Music for: "${query}"`);
+  try {
+    const matches = await findFilesByName(query);
+    console.log(`[FIND FILE] Found ${matches.length} match(es) for "${query}"`);
+    session.sendToolResponse({
+      functionResponses: [{
+        id: call.id,
+        name: call.name,
+        response: {
+          result: "ok",
+          message: matches.length === 0
+            ? `No files matching "${query}" were found in Desktop, Downloads, Documents, Pictures, Videos, or Music. Tell the user briefly, and ask if it's saved somewhere else.`
+            : `Found these file path(s): ${JSON.stringify(matches)}. If there's exactly one, go ahead and open it with openFile. If there's more than one, read out just the short file names (not the full paths) and ask which one the user means before opening.`
+        }
+      }]
+    });
+    notifyClient(clientWs, call, matches.length === 0 ? `No files found for "${query}"` : `Found ${matches.length} file(s) for "${query}"`);
+  } catch (err: any) {
+    console.error(`[FIND FILE] Failed:`, err);
+    session.sendToolResponse({
+      functionResponses: [{ id: call.id, name: call.name, response: { result: "error", message: "The file search failed unexpectedly. Let the user know briefly." } }]
+    });
+    notifyClient(clientWs, call, `File search failed`);
+  }
+}
+
+async function handleOpenFile(call: any, session: Session, clientWs: WebSocket) {
+  const filePath = String(call.args?.path || "").trim();
+  if (!filePath) {
+    session.sendToolResponse({
+      functionResponses: [{ id: call.id, name: call.name, response: { result: "error", message: "No file path was given." } }]
+    });
+    notifyClient(clientWs, call, `Couldn't open — no path given`);
+    return;
+  }
+
+  // Actually opening happens client-side via Electron's shell.openPath (see
+  // main.js: 'open-file-path', LiveSession.ts: 'openFileInElectron') — same
+  // fire-and-tell-Gemini-it's-done pattern as handleOpenWebsite/
+  // openInSystemBrowser above, which also doesn't wait for a round-trip
+  // success confirmation before responding.
+  console.log(`[OPEN FILE] Asking Electron to open: ${filePath}`);
+  if (clientWs.readyState === WebSocket.OPEN) {
+    clientWs.send(JSON.stringify({ type: "openFileInElectron", path: filePath }));
+  }
+  session.sendToolResponse({
+    functionResponses: [{ id: call.id, name: call.name, response: { result: "ok", message: "Opening now. Let the user know briefly." } }]
+  });
+  notifyClient(clientWs, call, `Opening file`);
+}
+
+// FEATURE (Zoya can spawn her own background AI agents for delegated
+// tasks, and proactively announces results when done): the user
+// specifically described wanting this: "main khud ke andar AI agents
+// build kar sakti hoon... jab tasks complete ho jaenge, toh main aapko
+// inform karke results bhej dungi." Scoped to research/analysis-style
+// tasks (uses Gemini + Google Search grounding) rather than anything
+// needing screen control — Gemini's API doesn't allow mixing googleSearch
+// with custom function-calling tools (like clickAt) in the same call, and
+// letting an unsupervised background process click around the user's PC
+// would need a lot more safety thought than a first version like this
+// should take on. For "go find out X" / "compare Y and Z" / "look into W
+// and tell me" style requests, though, this is a real, independent worker.
+//
+// `ai` is passed in explicitly (rather than making this a closure like
+// clickAt etc.) since it's created per-connection in the WebSocket
+// handler below, not at module level like the other handlers here.
+async function handleDelegateTask(call: any, session: Session, clientWs: WebSocket, ai: GoogleGenAI) {
+  const taskName = String(call.args?.taskName || "task").trim();
+  const taskDescription = String(call.args?.taskDescription || "").trim();
+
+  if (!taskDescription) {
+    session.sendToolResponse({
+      functionResponses: [{ id: call.id, name: call.name, response: { result: "error", message: "No task description was given." } }]
+    });
+    notifyClient(clientWs, call, `Couldn't start agent — no task given`);
+    return;
+  }
+
+  console.log(`[DELEGATE TASK] Starting background agent "${taskName}": ${taskDescription}`);
+
+  // Resolve the ORIGINAL call right away — Gemini shouldn't block the live
+  // conversation waiting for this; it just acknowledges and moves on. The
+  // real result comes back later as its own fresh system note (below),
+  // same "inject a note, Gemini decides how to say it out loud" pattern
+  // already used for confirmRequired / PC-access notices elsewhere here.
+  session.sendToolResponse({
+    functionResponses: [{
+      id: call.id,
+      name: call.name,
+      response: { result: "ok", message: `A background agent for "${taskName}" has started. Tell the user now, briefly, that an agent is working on it — don't wait for it to finish, keep talking normally.` }
+    }]
+  });
+  notifyClient(clientWs, call, `Agent working: ${taskName}`);
+
+  // The real work happens here, fully independent of the live session —
+  // this can take anywhere from a few seconds to a minute or more
+  // depending on the task, while the live conversation carries on as
+  // normal in the meantime. Multiple calls to this handler run
+  // concurrently without any extra tracking needed, since each is just an
+  // independent async chain — this is what lets more than one "agent" be
+  // in flight at once.
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-3.7-flash",
+      contents: taskDescription,
+      config: {
+        tools: [{ googleSearch: {} }]
+      }
+    });
+
+    const resultText = response.text || "The agent finished but didn't return any text.";
+    console.log(`[DELEGATE TASK] "${taskName}" finished:`, resultText.slice(0, 200));
+
+    try {
+      session.sendRealtimeInput({
+        text: `(System note: the background agent for "${taskName}" just finished. Here's what it found: ${resultText}. Tell the user about this now, out loud, proactively — don't wait for them to ask. Summarize naturally in your own voice, in Hinglish, rather than reading this whole note verbatim.)`
+      });
+    } catch (notifyErr) {
+      // The live session may have already ended by the time a longer task
+      // finishes — nothing more to do in that case, the result is just lost.
+      console.warn(`[DELEGATE TASK] Could not deliver result for "${taskName}" — session may have ended:`, notifyErr);
+    }
+    notifyClient(clientWs, call, `Agent finished: ${taskName}`);
+  } catch (err: any) {
+    console.error(`[DELEGATE TASK] "${taskName}" failed:`, err);
+    try {
+      session.sendRealtimeInput({
+        text: `(System note: the background agent for "${taskName}" failed to complete — something went wrong on the API side. Let the user know briefly, honestly.)`
+      });
+    } catch (notifyErr) {
+      console.warn(`[DELEGATE TASK] Could not deliver failure for "${taskName}" — session may have ended:`, notifyErr);
+    }
+    notifyClient(clientWs, call, `Agent failed: ${taskName}`);
+  }
+}
+
 async function handleOpenWebsite(call: any, session: Session, clientWs: WebSocket) {
   const url = String(call.args?.url || "");
   const siteName = call.args?.siteName ? String(call.args.siteName) : url;
 
-  // Runs only after the user has confirmed on screen (see SENSITIVE_TOOLS /
-  // toolConfirmation below) — the original function-call id was already
-  // resolved back then with "pending_confirmation", so we tell Gemini the
-  // real outcome as a fresh note instead of responding to that id again.
+  // FIX (confirm popup narrowed to sensitive actions only): this used to
+  // run only after an on-screen confirm; openWebsite is no longer gated
+  // (see TOOL_CONFIRMATION_LEVELS), so this now runs immediately when
+  // Gemini calls it. Kept using sendRealtimeInput rather than switching to
+  // sendToolResponse because the dispatch site already resolves the
+  // original call.id with "ok, running now" right before calling this (see
+  // the dispatch block) — same two-step shape as before, just without an
+  // actual wait for user approval in between anymore.
   if (!isSafeUrl(url)) {
     console.warn(`[OPEN WEBSITE] Rejected unsafe/invalid URL: "${url}"`);
     session.sendRealtimeInput({
-      text: `(System note: user confirmed opening a link, but it turned out invalid, so nothing opened. Let them know briefly.)`
+      text: `(System note: opening a link was requested, but it turned out invalid, so nothing opened. Let them know briefly.)`
     });
     notifyClient(clientWs, call, `Couldn't open that link`);
     return;
@@ -454,17 +666,17 @@ async function handleOpenWebsite(call: any, session: Session, clientWs: WebSocke
     // scrollScreen) to explicitly bring the browser window forward after
     // giving the OS a moment to actually route the new tab into it.
     await new Promise((resolve) => setTimeout(resolve, 800));
-    const focusedWindowTitle = await focusTargetWindow();
-    console.log(`[OPEN WEBSITE] Focused window after opening: ${focusedWindowTitle ?? "(none found — no other window open)"}`);
+    const focusedWindow = await focusTargetWindow();
+    console.log(`[OPEN WEBSITE] Focused window after opening: ${focusedWindow?.title ?? "(none found — no other window open)"}`);
 
     session.sendRealtimeInput({
-      text: `(System note: user confirmed — ${siteName} is now open in their browser.)`
+      text: `(System note: ${siteName} is now open in their browser.)`
     });
     notifyClient(clientWs, call, `Opened ${siteName}`);
   } catch (err: any) {
     console.error(`[OPEN WEBSITE] Failed:`, err);
     session.sendRealtimeInput({
-      text: `(System note: user confirmed, but opening ${siteName} failed. Let them know honestly.)`
+      text: `(System note: opening ${siteName} failed. Let them know honestly.)`
     });
     notifyClient(clientWs, call, `Couldn't open ${siteName}`);
   }
@@ -480,13 +692,15 @@ function buildLaunchCmd(target: string): string {
 async function handleOpenApplication(call: any, session: Session, clientWs: WebSocket) {
   const appName = String(call.args?.appName || "").trim();
 
-  // Runs only after the user has confirmed on screen — see the note at the
-  // top of handleOpenWebsite for why this uses sendRealtimeInput instead of
-  // sendToolResponse.
+  // FIX (confirm popup narrowed to sensitive actions only): openApplication
+  // is no longer gated (see TOOL_CONFIRMATION_LEVELS) — the dispatch site
+  // resolves the original call.id with "ok, running now" right before
+  // calling this, so this still uses sendRealtimeInput for the real
+  // outcome rather than a second sendToolResponse to the same id.
   if (!isSafeAppName(appName)) {
     console.warn(`[OPEN APP] Rejected invalid app name: "${appName}"`);
     session.sendRealtimeInput({
-      text: `(System note: user confirmed opening an app, but the name wasn't valid, so nothing was launched. Let them know briefly.)`
+      text: `(System note: opening an app was requested, but the name wasn't valid, so nothing was launched. Let them know briefly.)`
     });
     notifyClient(clientWs, call, `Didn't recognize that app name`);
     return;
@@ -500,7 +714,7 @@ async function handleOpenApplication(call: any, session: Session, clientWs: WebS
       await execAsync(buildLaunchCmd(remembered));
       console.log(`[OPEN APP] Launched "${appName}" via remembered path: ${remembered}`);
       session.sendRealtimeInput({
-        text: `(System note: user confirmed — ${appName} is now opening.)`
+        text: `(System note: ${appName} is now opening.)`
       });
       notifyClient(clientWs, call, `Opening ${appName}`);
       return;
@@ -516,7 +730,7 @@ async function handleOpenApplication(call: any, session: Session, clientWs: WebS
     await execAsync(buildLaunchCmd(appName));
     console.log(`[OPEN APP] Launched by name: ${appName}`);
     session.sendRealtimeInput({
-      text: `(System note: user confirmed — ${appName} is now opening.)`
+      text: `(System note: ${appName} is now opening.)`
     });
     notifyClient(clientWs, call, `Opening ${appName}`);
   } catch (err: any) {
@@ -524,7 +738,7 @@ async function handleOpenApplication(call: any, session: Session, clientWs: WebS
     // software that isn't on PATH. Ask to be taught the exact path once.
     console.error(`[OPEN APP] Failed to launch '${appName}':`, err?.message || err);
     session.sendRealtimeInput({
-      text: `(System note: user confirmed, but "${appName}" could not be found by name — it isn't on PATH. Ask the user for the exact .exe file location (e.g. by right-clicking its shortcut → Properties → Target), then call rememberAppLocation with that exact path so it opens instantly every time after this.)`
+      text: `(System note: "${appName}" could not be found by name — it isn't on PATH. Ask the user for the exact .exe file location (e.g. by right-clicking its shortcut → Properties → Target), then call rememberAppLocation with that exact path so it opens instantly every time after this.)`
     });
     notifyClient(clientWs, call, `Couldn't find "${appName}" — tell me its exact path`);
   }
@@ -717,8 +931,63 @@ const ZOYA_TOOLS: Array<{ functionDeclarations: ZoyaToolDeclaration[] }> = [
         }
       },
       {
+        // FEATURE (open existing files on the PC by voice): the user
+        // wanted "double-click to open" behavior for files already on
+        // their PC, not just creating new ones (createFile) or opening
+        // websites/apps. Pairs with openFile below — use this first when
+        // the exact path isn't already known.
+        name: "findFile",
+        description: "Searches the user's common personal folders (Desktop, Downloads, Documents, Pictures, Videos, Music) for files whose name contains the given text. Use this when the user asks to open a file but you don't already know its exact location — e.g. 'open my resume', 'find that vacation photo'. Returns matching file paths — if there's exactly one clear match, go ahead and open it with openFile; if there's more than one, read out the short file names and ask which one before opening.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            query: {
+              type: Type.STRING,
+              description: "Part of the file name to search for, e.g. 'resume' or 'vacation'."
+            }
+          },
+          required: ["query"]
+        }
+      },
+      {
+        name: "openFile",
+        description: "Opens an existing file on the user's PC with its default app — the same as the user double-clicking it in File Explorer (opens a PDF in a PDF viewer, a photo in Photos, a video in the default player, etc). Requires an exact file path — use findFile first if you don't already have one.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            path: {
+              type: Type.STRING,
+              description: "The full file path to open, typically taken from a findFile result."
+            }
+          },
+          required: ["path"]
+        }
+      },
+      {
+        // FEATURE (Zoya builds AI agents inside herself for multiple
+        // tasks, and tells the user proactively when done): see
+        // handleDelegateTask above for the full reasoning on scope
+        // (research/analysis tasks, not screen-control tasks).
+        name: "delegateTask",
+        description: "Starts an independent background AI agent to research, analyze, compare, or answer something — for anything the user wants looked into without blocking the live conversation while it works. Good for: 'find out X', 'compare A and B', 'look into Y and tell me what you find'. NOT for anything needing clicks/typing on screen — this agent can't see or control the screen, use clickAt/typeText directly for those instead. As soon as you call this, tell the user out loud that you've started an agent on it, then keep the conversation going normally — you'll get a system note, unprompted, whenever it finishes (could be anywhere from seconds to over a minute), and should tell the user about it right away when that happens, in your own words. You can call this more than once to have several agents working on different things at the same time.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {
+            taskName: {
+              type: Type.STRING,
+              description: "A short 2-5 word label for this task, e.g. 'gaming laptop research' — used to refer back to it later, especially if more than one agent is running at once."
+            },
+            taskDescription: {
+              type: Type.STRING,
+              description: "The full task, written as a clear, complete instruction or question. The background agent has no access to this conversation's earlier context, so include everything it needs to know."
+            }
+          },
+          required: ["taskName", "taskDescription"]
+        }
+      },
+      {
         name: "clickAt",
-        description: "Clicks the mouse at a specific point on the user's real screen — works inside ANY app or window, not just the browser (e.g. clicking a YouTube play button, a button in Notepad, a taskbar icon). Requires the user to be screen-sharing right now — without it there is no way to know what's on screen or where things are. ALWAYS look at the most recent shared screen image before calling this.",
+        description: "Clicks the mouse at a specific point on the user's real screen — works inside ANY app or window, not just the browser (e.g. clicking a YouTube play button, a button in Notepad, a taskbar icon). Requires the user to be screen-sharing right now — without it there is no way to know what's on screen or where things are. ALWAYS look at the most recent shared screen image before calling this. When there are several similar-looking items close together (e.g. multiple video thumbnails in a row, several buttons in a toolbar), look carefully at exactly which one matches what the user asked for by its title/label/content — not just its general position — before picking coordinates, since a small aim error can land on the wrong one of several neighbors.",
         parameters: {
           type: Type.OBJECT,
           properties: {
@@ -754,7 +1023,7 @@ const ZOYA_TOOLS: Array<{ functionDeclarations: ZoyaToolDeclaration[] }> = [
       },
       {
         name: "scrollScreen",
-        description: "Scrolls the mouse wheel up, down, left, or right at the current mouse position — works in ANY app or window, not just the browser.",
+        description: "Scrolls the mouse wheel up, down, left, or right at the current mouse position — works in ANY app or window, not just the browser. If the user doesn't give an exact amount, don't ask them for a percentage — just judge it yourself from what's visible: use a small amount (around 3-5) to nudge slightly, a medium amount (around 10-15) for a normal 'scroll down' request, or a larger amount (25+) if they want to jump further/skip past something. After scrolling, look at the next screen update — if the content you were looking for still isn't visible, scroll again rather than asking the user how far to go.",
         parameters: {
           type: Type.OBJECT,
           properties: {
@@ -764,10 +1033,31 @@ const ZOYA_TOOLS: Array<{ functionDeclarations: ZoyaToolDeclaration[] }> = [
             },
             amount: {
               type: Type.NUMBER,
-              description: "How many scroll 'steps' to perform. Defaults to 3 if omitted — a gentle scroll. Use a larger number for a bigger scroll."
+              description: "How many scroll 'steps' to perform. Pick this yourself based on the request and what's on screen — see the tool description. Defaults to 3 only if you truly have no basis to judge."
             }
           },
           required: ["direction"]
+        }
+      },
+      {
+        // FEATURE (voice-triggered PC access): starts screen sharing
+        // automatically — the user no longer has to click the screen-share
+        // button. Not in TOOL_CONFIRMATION_LEVELS on purpose: this should
+        // fire the instant the user asks, with no on-screen confirm popup
+        // in between.
+        name: "startPcAccess",
+        description: "Starts sharing the user's screen so you can see it and control their PC (click, type, scroll, open apps/websites) with voice commands. Call this the moment the user asks you to take control of their PC, access their screen, or take over their computer — e.g. 'mera PC access lo', 'meri screen dekho', 'take control of my computer', 'ab mera PC tum chalao'. Once started, stay in control across as many separate commands as the user gives — do NOT call stopPcAccess on your own just because one task finished; only the user ending access should stop it. The moment you call this, say out loud, in EXACTLY these words and nothing else first: \"Main aapka PC access le rahi hoon sir.\" Then wait for their next instruction.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {}
+        }
+      },
+      {
+        name: "stopPcAccess",
+        description: "Stops sharing the user's screen and gives control of their PC back to them. Call this ONLY when the user explicitly asks for their PC access back or asks you to stop controlling their computer — e.g. 'mera PC access wapas do', 'band karo', 'stop accessing my PC'. Let them know briefly, in your own words, that you've handed control back.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {}
         }
       }
     ]
@@ -822,18 +1112,33 @@ wss.on("connection", async (clientWs, req) => {
   // the real action only runs once `approvals` reaches `required`.
   const pendingConfirmations = new Map<string, { name: string; args: any; approvals: number; required: number }>();
 
+  // FEATURE (voice-triggered PC access): true once the user has said
+  // something like "mera PC access lo" and handleStartPcAccess has run;
+  // false again after handleStopPcAccess. Used to reset
+  // latestFrameResolution on stop (see handleStopPcAccess) and to log
+  // current status. NOTE: this does NOT gate anything anymore — see
+  // TOOL_CONFIRMATION_LEVELS below, which used to check this flag but no
+  // longer does, since the user wants clickAt/typeText/scrollScreen/
+  // openWebsite/openApplication to run immediately always, whether or not
+  // PC access was explicitly granted (manual screen-sharing should be just
+  // as frictionless as voice-granted access).
+  let pcAccessGranted = false;
+
   // Tool name -> how many separate times the user must approve it before it
-  // runs. 1 = a single confirm (the default for anything that reaches
-  // outside Zoya's own UI/workspace). Bump this for anything more sensitive
-  // later — e.g. a future email/account-login tool should be 3, not 1.
-  // A tool with no entry here isn't gated at all and runs immediately.
-  const TOOL_CONFIRMATION_LEVELS = new Map<string, number>([
-    ["openWebsite", 1],
-    ["openApplication", 1],
-    ["clickAt", 1],
-    ["typeText", 1],
-    ["scrollScreen", 1],
-  ]);
+  // runs. A tool with no entry here isn't gated at all and runs
+  // immediately. FIX (confirm popup narrowed to sensitive actions only):
+  // this used to list openWebsite/openApplication/clickAt/typeText/
+  // scrollScreen at level 1 each, gating every single one of those actions
+  // behind an on-screen confirm. The user only wants that friction for
+  // genuinely sensitive, hard/impossible-to-undo actions — deleting a file
+  // or folder, sending an email — not everyday screen interaction. Neither
+  // of those sensitive tools exists yet; add them here (e.g.
+  // ["deleteFile", 1] or 2-3 for something as sensitive as entering a
+  // password/logging in, per the user's own stated preference) when they're
+  // built, and they'll automatically go through the exact same
+  // pendingConfirmations/confirmRequired flow below — no other changes
+  // needed.
+  const TOOL_CONFIRMATION_LEVELS = new Map<string, number>([]);
 
   // FIX (PC-wide click/scroll control): the image Gemini sees is downscaled
   // (see ScreenSharer.ts, maxDimension = 800) to save bandwidth, so a click
@@ -908,18 +1213,18 @@ wss.on("connection", async (clientWs, req) => {
     if (!real) {
       console.warn(`[CLICK AT] No screen frame received yet — can't scale coordinates (${scaledX}, ${scaledY})`);
       session.sendRealtimeInput({
-        text: `(System note: user confirmed the click, but the user's screen isn't being shared right now, so there's no way to know where on the real screen that is. Ask them to turn on screen sharing first, briefly.)`
+        text: `(System note: the click was requested, but the user's screen isn't being shared right now, so there's no way to know where on the real screen that is. Ask them to turn on screen sharing first, briefly.)`
       });
       notifyClient(clientWs, call, `Can't click — screen sharing is off`);
       return;
     }
 
-    const focusedWindowTitle = await focusTargetWindow();
-    console.log(`[CLICK AT] Focused window before click: ${focusedWindowTitle ?? "(none found — no other window open)"}`);
+    const focusedWindow = await focusTargetWindow();
+    console.log(`[CLICK AT] Focused window before click: ${focusedWindow?.title ?? "(none found — no other window open)"}`);
 
-    if (!focusedWindowTitle) {
+    if (!focusedWindow) {
       session.sendRealtimeInput({
-        text: `(System note: user confirmed the click, but there's no other window open to click into — only Zoya's own window is open. Ask them to open the browser or app they want clicked, briefly.)`
+        text: `(System note: the click was requested, but there's no other window open to click into — only Zoya's own window is open. Ask them to open the browser or app they want clicked, briefly.)`
       });
       notifyClient(clientWs, call, `Can't click — no other window is open`);
       return;
@@ -934,13 +1239,13 @@ wss.on("connection", async (clientWs, req) => {
       }
       console.log(`[CLICK AT] Clicked at real screen (${real.x}, ${real.y}) from scaled (${scaledX}, ${scaledY})`);
       session.sendRealtimeInput({
-        text: `(System note: user confirmed — the click was performed. Let them know briefly.)`
+        text: `(System note: the click was performed. Let them know briefly.)`
       });
       notifyClient(clientWs, call, `Clicked`);
     } catch (err: any) {
       console.error(`[CLICK AT] Failed:`, err);
       session.sendRealtimeInput({
-        text: `(System note: user confirmed the click, but it failed to actually run — likely a setup issue on this machine, not something the user did wrong. Let them know honestly, briefly.)`
+        text: `(System note: the click was requested, but it failed to actually run — likely a setup issue on this machine, not something the user did wrong. Let them know honestly, briefly.)`
       });
       notifyClient(clientWs, call, `Click failed`);
     }
@@ -954,12 +1259,12 @@ wss.on("connection", async (clientWs, req) => {
       return;
     }
 
-    const focusedWindowTitle = await focusTargetWindow();
-    console.log(`[TYPE TEXT] Focused window before typing: ${focusedWindowTitle ?? "(none found — no other window open)"}`);
+    const focusedWindow = await focusTargetWindow();
+    console.log(`[TYPE TEXT] Focused window before typing: ${focusedWindow?.title ?? "(none found — no other window open)"}`);
 
-    if (!focusedWindowTitle) {
+    if (!focusedWindow) {
       session.sendRealtimeInput({
-        text: `(System note: user confirmed typing, but there's no other window open to type into — only Zoya's own window is open. Ask them to open the browser or app they want typed into, briefly.)`
+        text: `(System note: typing was requested, but there's no other window open to type into — only Zoya's own window is open. Ask them to open the browser or app they want typed into, briefly.)`
       });
       notifyClient(clientWs, call, `Can't type — no other window is open`);
       return;
@@ -969,13 +1274,13 @@ wss.on("connection", async (clientWs, req) => {
       await keyboard.type(text);
       console.log(`[TYPE TEXT] Typed ${text.length} characters`);
       session.sendRealtimeInput({
-        text: `(System note: user confirmed — the text was typed. Let them know briefly.)`
+        text: `(System note: the text was typed. Let them know briefly.)`
       });
       notifyClient(clientWs, call, `Typed it`);
     } catch (err: any) {
       console.error(`[TYPE TEXT] Failed:`, err);
       session.sendRealtimeInput({
-        text: `(System note: user confirmed typing, but it failed to actually run — likely a setup issue on this machine, not something the user did wrong. Let them know honestly, briefly.)`
+        text: `(System note: typing was requested, but it failed to actually run — likely a setup issue on this machine, not something the user did wrong. Let them know honestly, briefly.)`
       });
       notifyClient(clientWs, call, `Typing failed`);
     }
@@ -985,18 +1290,31 @@ wss.on("connection", async (clientWs, req) => {
     const direction = String(call.args?.direction || "down").toLowerCase();
     const amount = Number(call.args?.amount) || 3;
 
-    const focusedWindowTitle = await focusTargetWindow();
-    console.log(`[SCROLL] Focused window before scrolling: ${focusedWindowTitle ?? "(none found — no other window open)"}`);
+    const focusedWindow = await focusTargetWindow();
+    console.log(`[SCROLL] Focused window before scrolling: ${focusedWindow?.title ?? "(none found — no other window open)"}`);
 
-    if (!focusedWindowTitle) {
+    if (!focusedWindow) {
       session.sendRealtimeInput({
-        text: `(System note: user confirmed scrolling, but there's no other window open to scroll — only Zoya's own window is open. Ask them to open the browser or app they want scrolled, briefly.)`
+        text: `(System note: scrolling was requested, but there's no other window open to scroll — only Zoya's own window is open. Ask them to open the browser or app they want scrolled, briefly.)`
       });
       notifyClient(clientWs, call, `Can't scroll — no other window is open`);
       return;
     }
 
     try {
+      // FIX (scroll landing in the wrong place): mouse.scrollUp/Down/Left/
+      // Right() is an OS-level scroll-wheel event -- it goes to whichever
+      // window is under the MOUSE CURSOR, not whichever window merely has
+      // OS focus. Focusing the window (above) was never enough by itself;
+      // the cursor has to actually be moved into it first, or the scroll
+      // silently lands wherever the cursor was last sitting (often still
+      // over Zoya's own window). The window's center is a safe point
+      // that's always inside it regardless of size/position.
+      const { left, top, width, height } = focusedWindow.region;
+      const centerPoint = new Point(Math.round(left + width / 2), Math.round(top + height / 2));
+      await mouse.setPosition(centerPoint);
+      console.log(`[SCROLL] Moved cursor to window center (${centerPoint.x}, ${centerPoint.y}) before scrolling`);
+
       if (direction === "up") {
         await mouse.scrollUp(amount);
       } else if (direction === "left") {
@@ -1008,16 +1326,70 @@ wss.on("connection", async (clientWs, req) => {
       }
       console.log(`[SCROLL] Scrolled ${direction} by ${amount}`);
       session.sendRealtimeInput({
-        text: `(System note: user confirmed — the scroll was performed. Let them know briefly.)`
+        text: `(System note: the scroll was performed. Let them know briefly.)`
       });
       notifyClient(clientWs, call, `Scrolled ${direction}`);
     } catch (err: any) {
       console.error(`[SCROLL] Failed:`, err);
       session.sendRealtimeInput({
-        text: `(System note: user confirmed scrolling, but it failed to actually run — likely a setup issue on this machine, not something the user did wrong. Let them know honestly, briefly.)`
+        text: `(System note: scrolling was requested, but it failed to actually run — likely a setup issue on this machine, not something the user did wrong. Let them know honestly, briefly.)`
       });
       notifyClient(clientWs, call, `Scroll failed`);
     }
+  }
+
+  // FEATURE (voice-triggered PC access): these two are NOT in
+  // TOOL_CONFIRMATION_LEVELS, so they run immediately when Gemini calls
+  // them (same dispatch pattern as handleCreateFile/handleSearchWeb) —
+  // matching the user's ask: no on-screen confirm popup for these, they
+  // should fire the instant the user asks by voice.
+  //
+  // Reuses the exact same client-side toggleScreenShare() that the manual
+  // "Share Screen" button already calls (see LiveSession.ts /
+  // VoiceControls.tsx) — this just triggers it from a voice command
+  // instead of a click. `latestFrameResolution` (used by scaleToRealCoordinates
+  // for clickAt) is closure-scoped here, same as handleClickAt/handleScroll
+  // above.
+  async function handleStartPcAccess(call: any, session: Session, clientWs: WebSocket) {
+    console.log(`[PC ACCESS] Start requested — asking client to begin screen sharing.`);
+    pcAccessGranted = true;
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(JSON.stringify({ type: "screenShareControl", action: "start" }));
+    }
+    session.sendToolResponse({
+      functionResponses: [{
+        id: call.id,
+        name: call.name,
+        response: {
+          result: "ok",
+          message: `Screen sharing is starting now. Say exactly these words out loud, nothing else first: "Main aapka PC access le rahi hoon sir." Then wait for the user's next instruction.`
+        }
+      }]
+    });
+    notifyClient(clientWs, call, `PC access started`);
+  }
+
+  async function handleStopPcAccess(call: any, session: Session, clientWs: WebSocket) {
+    console.log(`[PC ACCESS] Stop requested — asking client to end screen sharing.`);
+    pcAccessGranted = false;
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(JSON.stringify({ type: "screenShareControl", action: "stop" }));
+    }
+    // Clear the cached frame size so a stray clickAt/scrollScreen call
+    // arriving right after access is revoked can't scale against a stale
+    // resolution from the now-ended share.
+    latestFrameResolution = null;
+    session.sendToolResponse({
+      functionResponses: [{
+        id: call.id,
+        name: call.name,
+        response: {
+          result: "ok",
+          message: `Screen sharing has stopped. Let the user know their PC access has been given back, briefly, in your own words.`
+        }
+      }]
+    });
+    notifyClient(clientWs, call, `PC access stopped`);
   }
 
   const MAX_RECONNECT_ATTEMPTS = 5;
@@ -1040,6 +1412,20 @@ wss.on("connection", async (clientWs, req) => {
         config: {
           responseModalities: [Modality.AUDIO],
           outputAudioTranscription: {},
+          // FIX (clicks landing NEAR a title/button instead of exactly on
+          // it, and small elements like a YouTube ad's "Skip" button not
+          // being found at all): by default Gemini processes each incoming
+          // video frame at a modest per-frame token budget, which is fine
+          // for general scene understanding but not enough to reliably
+          // read small on-screen text or pick out one specific element
+          // among several closely-packed ones (like video thumbnails in a
+          // grid). MEDIA_RESOLUTION_HIGH tells Gemini to spend more tokens
+          // per frame specifically for this kind of precision -- Google's
+          // own docs call this out for exactly this use case ("reading
+          // dense text / small details within video frames"). Costs more
+          // tokens per frame; worth it here since precise clicking is the
+          // whole point of this feature.
+          mediaResolution: MediaResolution.MEDIA_RESOLUTION_HIGH,
           // FIX (user's own voice never shows up as text anywhere): this
           // was missing entirely. outputAudioTranscription above only
           // covers Zoya's own spoken replies being converted to text --
@@ -1188,8 +1574,12 @@ wss.on("connection", async (clientWs, req) => {
                       // Gemini gets a "pending_confirmation" result now so it
                       // doesn't hang — it'll hear the real outcome once the
                       // user has approved it `required` separate times (see
-                      // handleOpenWebsite/handleOpenApplication and the
-                      // toolConfirmation branch below).
+                      // the toolConfirmation branch below). As of now
+                      // TOOL_CONFIRMATION_LEVELS is empty — reserved for
+                      // future sensitive tools (deleteFile, sendEmail, etc.)
+                      // — so this branch currently never triggers, but stays
+                      // in place so adding a sensitive tool later is a
+                      // one-line Map entry, not new gating logic.
                       const required = TOOL_CONFIRMATION_LEVELS.get(call.name)!;
                       pendingConfirmations.set(call.id, { name: call.name, args: call.args, approvals: 0, required });
 
@@ -1217,6 +1607,50 @@ wss.on("connection", async (clientWs, req) => {
                           approvalsSoFar: 0
                         }));
                       }
+                    } else if (call.name === "openWebsite" || call.name === "openApplication" || call.name === "clickAt" || call.name === "typeText" || call.name === "scrollScreen") {
+                      // FIX (confirm popup narrowed to sensitive actions
+                      // only): these five used to ALL require an on-screen
+                      // confirm before running, every single time. The user
+                      // only wants that friction for genuinely sensitive
+                      // actions (deleting a file/folder, sending an email —
+                      // neither exists as a tool yet, see
+                      // TOOL_CONFIRMATION_LEVELS above) — not for everyday
+                      // screen interaction, and not just while PC access
+                      // happens to be granted: this applies whether the user
+                      // granted PC access by voice OR is manually
+                      // screen-sharing. So these five now run immediately.
+                      //
+                      // IMPORTANT: these five handlers were originally only
+                      // ever called from the toolConfirmation branch further
+                      // below, AFTER the original call.id had already been
+                      // resolved there with "pending_confirmation" — that's
+                      // why the handlers themselves report their outcome via
+                      // session.sendRealtimeInput (a fresh system note)
+                      // rather than session.sendToolResponse. Calling them
+                      // directly here means THIS call.id has never been
+                      // resolved at all yet, so — same as the immediate
+                      // tools below (createFile etc.) — resolve it right
+                      // away with "ok, running now" before dispatching, or
+                      // Gemini is left waiting on a function response that
+                      // never comes.
+                      session.sendToolResponse({
+                        functionResponses: [{
+                          id: call.id,
+                          name: call.name,
+                          response: { result: "ok", message: "Running now." }
+                        }]
+                      });
+                      if (call.name === "openWebsite") {
+                        handleOpenWebsite(call, session, clientWs);
+                      } else if (call.name === "openApplication") {
+                        handleOpenApplication(call, session, clientWs);
+                      } else if (call.name === "clickAt") {
+                        handleClickAt(call, session, clientWs);
+                      } else if (call.name === "typeText") {
+                        handleTypeText(call, session, clientWs);
+                      } else if (call.name === "scrollScreen") {
+                        handleScroll(call, session, clientWs);
+                      }
                     } else if (call.name === "createFile") {
                       handleCreateFile(call, session, clientWs);
                     } else if (call.name === "createFolder") {
@@ -1225,6 +1659,16 @@ wss.on("connection", async (clientWs, req) => {
                       handleSearchWeb(call, session, clientWs);
                     } else if (call.name === "rememberAppLocation") {
                       handleRememberAppLocation(call, session, clientWs);
+                    } else if (call.name === "findFile") {
+                      handleFindFile(call, session, clientWs);
+                    } else if (call.name === "openFile") {
+                      handleOpenFile(call, session, clientWs);
+                    } else if (call.name === "delegateTask") {
+                      handleDelegateTask(call, session, clientWs, ai);
+                    } else if (call.name === "startPcAccess") {
+                      handleStartPcAccess(call, session, clientWs);
+                    } else if (call.name === "stopPcAccess") {
+                      handleStopPcAccess(call, session, clientWs);
                     } else if (clientWs.readyState === WebSocket.OPEN) {
                       // Existing client-side tools (changeThemeColor,
                       // showVisualAction) — unchanged, still forwarded to the browser.

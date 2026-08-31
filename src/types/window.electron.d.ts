@@ -13,6 +13,9 @@ declare global {
       // resolution the screen-share capture stream is downscaled to.
       // Returns null if Electron's screen module couldn't be reached.
       getRealScreenSize: () => Promise<{ width: number; height: number } | null>;
+      // FEATURE (open existing files on the PC by voice): mirrors
+      // openExternalUrl, but for local files via shell.openPath.
+      openFilePath: (path: string) => Promise<{ ok: boolean; error?: string }>;
     };
   }
 }

@@ -104,6 +104,19 @@ export class ScreenSharer {
     this.onFrame = onFrame;
     this.onEnded = onEnded;
     this.onError = onError;
+    // FIX (severe reply latency + wrong clicks returned, right after the
+    // previous round's changes): that round stacked THREE token-increasing
+    // changes at once -- MEDIA_RESOLUTION_HIGH (more tokens per frame),
+    // 1280px frames (up from 800), and 1000ms frame rate (twice as many
+    // frames per minute as before). Individually reasonable, but together
+    // they multiplied the per-minute token volume Gemini has to process
+    // far more than intended, which is almost certainly what pushed
+    // response latency up to several seconds and made clicks land on a
+    // stale/queued-up frame instead of the current one. Reverting the
+    // frame RATE back to 2000ms while keeping MEDIA_RESOLUTION_HIGH and the
+    // 1280px size -- so each individual frame Gemini sees is still sharp
+    // and detailed enough for precise clicking, but it isn't being asked
+    // to process twice as many of them per minute on top of that.
     this.minFrameIntervalMs = Math.max(2000, intervalMs);
     this.frameCount = 0;
     this.droppedFrames = 0;
@@ -286,7 +299,15 @@ export class ScreenSharer {
       return;
     }
 
-    const maxDimension = 800;
+    // FIX (clicks landing near but not exactly on small elements, e.g. a
+    // specific video title in a grid, or missing a small "Skip Ad"
+    // button): this was 800, an EXTRA downscale on top of the capture
+    // stream's own 1280x720 ceiling (see requestDisplayStream's
+    // getUserMedia constraints above) -- meaning frames were being
+    // shrunk twice. 1280 matches the capture ceiling exactly, so this
+    // removes the second, unnecessary downscale without capturing or
+    // sending anything larger than what was already being captured.
+    const maxDimension = 1280;
     let targetWidth = width;
     let targetHeight = height;
 
@@ -307,7 +328,14 @@ export class ScreenSharer {
     this.canvasCtx.drawImage(this.videoElement, 0, 0, targetWidth, targetHeight);
 
     try {
-      const dataUrl = this.canvasElement.toDataURL('image/jpeg', 0.5);
+      // FIX (same as above): 0.5 JPEG quality introduced compression
+      // artifacts that hit small text and thin button edges hardest --
+      // exactly the detail needed to tell "this video's title" apart from
+      // the one next to it, or spot a small skip-ad control. 0.75 is a
+      // meaningfully sharper frame for a modest size increase; frames are
+      // only sent once every couple of seconds (not a live video stream),
+      // so the extra bytes per frame aren't a real bandwidth concern here.
+      const dataUrl = this.canvasElement.toDataURL('image/jpeg', 0.75);
       const base64Data = dataUrl.split(',')[1];
 
       if (base64Data && this.onFrame) {
