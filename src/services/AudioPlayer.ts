@@ -1,7 +1,7 @@
 import { AudioContextManager } from './AudioContextManager';
 
 /**
- * AudioPlayer handles output audio playback for Zoya.
+ * AudioPlayer handles output audio playback for Aanya.
  * Plays 24kHz PCM16 Little-Endian audio chunks from Gemini Live API
  * using gapless Web Audio API scheduling.
  */
@@ -226,4 +226,3 @@ export class AudioPlayer {
     }
   }
 }
-

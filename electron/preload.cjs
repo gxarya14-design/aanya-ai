@@ -37,4 +37,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
       return { ok: false, error: String(error?.message || error) };
     }
   },
+  selectChatAttachment: async () => {
+    try {
+      return await ipcRenderer.invoke('select-chat-attachment');
+    } catch (error) {
+      console.error('[Preload] Error selecting chat attachment:', error);
+      return null;
+    }
+  },
 });

@@ -16,6 +16,7 @@ declare global {
       // FEATURE (open existing files on the PC by voice): mirrors
       // openExternalUrl, but for local files via shell.openPath.
       openFilePath: (path: string) => Promise<{ ok: boolean; error?: string }>;
+      selectChatAttachment: () => Promise<{ name: string; size: number; mimeType: string; data: string; error?: string } | null>;
     };
   }
 }

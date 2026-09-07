@@ -20,6 +20,37 @@ export interface TranscriptItem {
   timestamp: number;
   filePath?: string;
   fileKind?: 'file' | 'folder';
+  fileName?: string;
+  fileSize?: number;
+}
+
+// The workspace path is the single source of truth. Chat cards keep only a
+// reference; content is fetched afresh when View or Download is requested.
+export interface WorkspaceFile {
+  name: string;
+  path: string;
+  kind: 'file' | 'folder';
+  size?: number;
+}
+
+export interface WorkspaceFileReadResult {
+  name: string;
+  path: string;
+  size: number;
+  mimeType: string;
+  previewAvailable: boolean;
+  content?: string;
+  data?: string;
+  error?: string;
+}
+
+export interface ChatAttachment {
+  id: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  status: 'uploading' | 'ready' | 'processing' | 'failed';
+  error?: string;
 }
 
 export interface ZoyaConfig {

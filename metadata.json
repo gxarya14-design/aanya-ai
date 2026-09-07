@@ -1,5 +1,5 @@
 {
-  "name": "Zoya AI Assistant",
+  "name": "Aanya AI Assistant",
   "description": "A real-time, voice-to-voice AI assistant web application powered by Gemini Live API with a witty, sassy, and playful persona.",
   "requestFramePermissions": ["microphone", "display-capture"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

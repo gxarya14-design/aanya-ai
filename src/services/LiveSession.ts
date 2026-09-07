@@ -1,4 +1,4 @@
-import { SessionState, ZoyaVoice, ToolCallEvent, ConfirmRequiredEvent } from '../types';
+import { SessionState, ZoyaVoice, ToolCallEvent, ConfirmRequiredEvent, ChatAttachment, WorkspaceFile, WorkspaceFileReadResult } from '../types';
 import { AudioPlayer } from './AudioPlayer';
 import { AudioRecorder } from './AudioRecorder';
 import { ScreenSharer } from './ScreenSharer';
@@ -13,6 +13,8 @@ export interface LiveSessionCallbacks {
   onConfirmRequired: (event: ConfirmRequiredEvent) => void;
   onError: (error: string) => void;
   onScreenShareChange?: (isSharing: boolean) => void;
+  onAttachmentStatus?: (attachment: ChatAttachment) => void;
+  onFileCreated?: (file: WorkspaceFile) => void;
 }
 
 export class LiveSession {
@@ -28,6 +30,10 @@ export class LiveSession {
   private micPacketCount: number = 0;
   private geminiAudioPacketCount: number = 0;
   private speechRecognizer: any = null;
+  private workspaceFileRequests = new Map<string, {
+    resolve: (result: WorkspaceFileReadResult) => void;
+    reject: (error: Error) => void;
+  }>();
 
   constructor(callbacks: LiveSessionCallbacks, voice: ZoyaVoice = 'Kore') {
     this.callbacks = callbacks;
@@ -297,6 +303,22 @@ export class LiveSession {
               resultMessage: msg.resultMessage
             };
             this.callbacks.onToolCall(event);
+          } else if (msg.type === 'attachmentStatus' && msg.attachment) {
+            this.callbacks.onAttachmentStatus?.(msg.attachment);
+          } else if (msg.type === 'fileCreated' && msg.path && msg.name) {
+            this.callbacks.onFileCreated?.({
+              name: msg.name,
+              path: msg.path,
+              kind: msg.kind === 'folder' ? 'folder' : 'file',
+              size: typeof msg.size === 'number' ? msg.size : undefined,
+            });
+          } else if (msg.type === 'workspaceFileResult' && msg.requestId) {
+            const request = this.workspaceFileRequests.get(msg.requestId);
+            if (request) {
+              this.workspaceFileRequests.delete(msg.requestId);
+              if (msg.error) request.reject(new Error(msg.error));
+              else request.resolve(msg.file as WorkspaceFileReadResult);
+            }
           } else if (msg.type === 'openUrlInElectron' && msg.url) {
             // FIX (Chrome never visibly opens, even though the terminal log
             // shows the correct URL): server.ts's openInSystemBrowser() has
@@ -351,7 +373,7 @@ export class LiveSession {
               });
             } else {
               console.warn('[OPEN FILE] No electronAPI bridge — opening files requires the desktop app.');
-              this.callbacks.onError('Opening files only works in the Zoya desktop app, not in a browser tab.');
+              this.callbacks.onError('Opening files only works in the Aanya desktop app, not in a browser tab.');
             }
           } else if (msg.type === 'screenShareControl') {
             // FEATURE (voice-triggered PC access): server.ts's
@@ -382,7 +404,7 @@ export class LiveSession {
 
       this.ws.onerror = (evt) => {
         console.error("[LiveSession Debug] Client WebSocket error:", evt);
-        this.callbacks.onError("Connection failed to Zoya Live Assistant.");
+        this.callbacks.onError("Connection failed to Aanya Live Assistant.");
         this.setState('error');
       };
 
@@ -402,15 +424,39 @@ export class LiveSession {
     }
   }
 
-  public sendTextMessage(text: string): void {
+  public sendTextMessage(text: string, attachmentIds: string[] = []): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       console.log(`[USER TEXT RECEIVED] Outgoing user typed text: "${text}"`);
       this.player?.stopAll();
       this.isModelResponding = true;
       this.callbacks.onTextReceived(text, true);
       this.setState('thinking');
-      this.ws.send(JSON.stringify({ type: 'text', text }));
+      this.ws.send(JSON.stringify({ type: 'text', text, attachmentIds }));
     }
+  }
+
+  public uploadAttachment(attachment: ChatAttachment, data: string): void {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: 'attachment', attachment, data }));
+    }
+  }
+
+  public readWorkspaceFile(file: WorkspaceFile, mode: 'view' | 'download'): Promise<WorkspaceFileReadResult> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error('Aanya is not connected.'));
+    }
+    const requestId = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      this.workspaceFileRequests.set(requestId, { resolve, reject });
+      this.ws?.send(JSON.stringify({ type: 'workspaceFileRequest', requestId, path: file.path, mode }));
+      window.setTimeout(() => {
+        const pending = this.workspaceFileRequests.get(requestId);
+        if (pending) {
+          this.workspaceFileRequests.delete(requestId);
+          pending.reject(new Error('The file request timed out.'));
+        }
+      }, 15000);
+    });
   }
 
   private handleUserInterrupt(): void {
@@ -479,6 +525,10 @@ export class LiveSession {
     this.recorder?.stop();
     this.player?.stopAll();
     this.setState('disconnected');
+    for (const pending of this.workspaceFileRequests.values()) {
+      pending.reject(new Error('Aanya disconnected before the file could be read.'));
+    }
+    this.workspaceFileRequests.clear();
   }
 
   public destroy(): void {

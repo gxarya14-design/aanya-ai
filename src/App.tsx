@@ -11,6 +11,10 @@ import {
   X,
   AlertCircle,
   ShieldAlert,
+  Plus,
+  FileText,
+  Eye,
+  Download,
 } from "lucide-react";
 
 import {
@@ -20,6 +24,9 @@ import {
   ToolCallEvent,
   TranscriptItem,
   ConfirmRequiredEvent,
+  ChatAttachment,
+  WorkspaceFile,
+  WorkspaceFileReadResult,
 } from "./types";
 
 import { LiveSession } from "./services/LiveSession";
@@ -124,6 +131,13 @@ export default function App() {
 
   const [errorMessage, setErrorMessage] =
     useState<string | null>(null);
+
+  const [workspaceViewer, setWorkspaceViewer] = useState<{
+    file: WorkspaceFile;
+    status: "loading" | "ready" | "unavailable" | "error";
+    result?: WorkspaceFileReadResult;
+    error?: string;
+  } | null>(null);
 
   const [config, setConfig] = useState<ZoyaConfig>({
     voice: "Kore",
@@ -245,7 +259,7 @@ export default function App() {
              * Gemini sometimes sends the same assistant
              * response in multiple chunks.
              *
-             * Join recent Zoya chunks together.
+             * Join recent Aanya chunks together.
              */
 
             if (
@@ -328,6 +342,25 @@ export default function App() {
         onScreenShareChange: (sharing) => {
           setIsScreenSharing(sharing);
         },
+        onAttachmentStatus: () => {
+          // ChatInput owns its attachment state. Server status is reflected
+          // in the transcript/tool notification rather than duplicated here.
+        },
+        onFileCreated: (file) => {
+          setTranscripts((previous) => [
+            ...previous,
+            {
+              id: `file-${Date.now()}-${Math.random()}`,
+              sender: "system",
+              text: `${file.name} is ready in the workspace.`,
+              timestamp: Date.now(),
+              filePath: file.path,
+              fileKind: file.kind,
+              fileName: file.name,
+              fileSize: file.size,
+            },
+          ]);
+        },
       },
       config.voice
     );
@@ -357,7 +390,7 @@ export default function App() {
    * AUTO SCROLL CHAT
    * ---------------------------------------------------------
    * Keeps the messages panel pinned to the latest message
-   * whenever a new one arrives, or an existing Zoya message
+   * whenever a new one arrives, or an existing Aanya message
    * grows (streamed chunks get appended to the last item).
    */
 
@@ -399,7 +432,7 @@ export default function App() {
       setErrorMessage(
         error instanceof Error
           ? error.message
-          : "Unable to connect to Zoya."
+          : "Unable to connect to Aanya."
       );
     }
   };
@@ -455,10 +488,10 @@ export default function App() {
    * ---------------------------------------------------------
    */
 
-  const handleSendMessage = (text: string) => {
+  const handleSendMessage = (text: string, attachments: ChatAttachment[]) => {
     const message = text.trim();
 
-    if (!message) {
+    if (!message && attachments.length === 0) {
       return;
     }
 
@@ -480,12 +513,12 @@ export default function App() {
       {
         id: `${Date.now()}-${Math.random()}`,
         sender: "user",
-        text: message,
+        text: message || `Attached: ${attachments.map((attachment) => attachment.name).join(', ')}`,
         timestamp: Date.now(),
       },
     ]);
 
-    sessionRef.current.sendTextMessage(message);
+    sessionRef.current.sendTextMessage(message || "Please analyze the attached file.", attachments.map((attachment) => attachment.id));
   };
 
   /*
@@ -502,6 +535,43 @@ export default function App() {
         "Unable to copy message:",
         error
       );
+    }
+  };
+
+  const handleViewWorkspaceFile = async (file: WorkspaceFile) => {
+    setWorkspaceViewer({ file, status: "loading" });
+    try {
+      const result = await sessionRef.current?.readWorkspaceFile(file, "view");
+      if (!result) throw new Error("Aanya is not connected.");
+      setWorkspaceViewer({
+        file,
+        status: result.previewAvailable ? "ready" : "unavailable",
+        result,
+      });
+    } catch (error) {
+      setWorkspaceViewer({
+        file,
+        status: "error",
+        error: error instanceof Error ? error.message : "Unable to open this file.",
+      });
+    }
+  };
+
+  const handleDownloadWorkspaceFile = async (file: WorkspaceFile) => {
+    try {
+      const result = await sessionRef.current?.readWorkspaceFile(file, "download");
+      if (!result?.data) throw new Error(result?.error || "Unable to download this file.");
+      const bytes = Uint8Array.from(atob(result.data), (character) => character.charCodeAt(0));
+      const url = URL.createObjectURL(new Blob([bytes], { type: result.mimeType || "application/octet-stream" }));
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = result.name;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Unable to download this file.");
     }
   };
 
@@ -558,7 +628,7 @@ export default function App() {
 
       <header className="zoya-topbar">
         <div className="zoya-logo">
-          ZOYA
+          AANYA
         </div>
 
         <div className="zoya-status">
@@ -604,14 +674,14 @@ export default function App() {
 
       <main className="zoya-main">
         {/* =================================================
-            LEFT / MAIN ZOYA AREA
+            LEFT / MAIN AANYA AREA
         ================================================= */}
 
         <section className="zoya-visual">
           <div className="zoya-picture-frame">
             <img
               src={zoyaAvatar}
-              alt="Zoya"
+              alt="Aanya"
               className="zoya-main-image"
             />
 
@@ -648,7 +718,7 @@ export default function App() {
                 {!isConnected
                   ? "Tap power to start"
                   : sessionState === "speaking"
-                    ? "Zoya is speaking"
+                    ? "Aanya is speaking"
                     : isMuted
                       ? "Microphone muted"
                       : "Listening"}
@@ -699,8 +769,8 @@ export default function App() {
                 onClick={handleToggleConnect}
                 title={
                   isConnected
-                    ? "Disconnect Zoya"
-                    : "Start Zoya"
+                    ? "Disconnect Aanya"
+                    : "Start Aanya"
                 }
               >
                 <Power size={30} />
@@ -747,13 +817,13 @@ export default function App() {
             <div className="zoya-chat-avatar">
               <img
                 src={zoyaAvatar}
-                alt="Zoya"
+                alt="Aanya"
               />
             </div>
 
             <div>
               <div className="zoya-chat-name">
-                Zoya
+                Aanya
               </div>
 
               <div className="zoya-chat-state">
@@ -791,7 +861,7 @@ export default function App() {
                 </div>
 
                 <small>
-                  You can speak with Zoya or type
+                  You can speak with Aanya or type
                   a message below.
                 </small>
               </div>
@@ -802,6 +872,8 @@ export default function App() {
                   message={message}
                   avatar={zoyaAvatar}
                   onCopy={handleCopyMessage}
+                  onViewFile={handleViewWorkspaceFile}
+                  onDownloadFile={handleDownloadWorkspaceFile}
                 />
               ))
             )}
@@ -814,9 +886,18 @@ export default function App() {
           <ChatInput
             disabled={!isConnected}
             onSend={handleSendMessage}
+            onUpload={(attachment, data) => sessionRef.current?.uploadAttachment(attachment, data)}
           />
         </aside>
       </main>
+
+      {workspaceViewer && (
+        <WorkspaceViewer
+          viewer={workspaceViewer}
+          onClose={() => setWorkspaceViewer(null)}
+          onDownload={handleDownloadWorkspaceFile}
+        />
+      )}
 
       {/* ---------------------------------------------------
           TOOL EVENT
@@ -875,7 +956,7 @@ export default function App() {
             </div>
 
             <div className="zoya-confirm-subtext">
-              Zoya is asking permission before doing this.
+              Aanya is asking permission before doing this.
             </div>
 
             {pendingConfirmation.approvalsNeeded > 1 && (
@@ -923,12 +1004,16 @@ interface ChatMessageProps {
   message: TranscriptItem;
   avatar: string;
   onCopy: (text: string) => void;
+  onViewFile: (file: WorkspaceFile) => void;
+  onDownloadFile: (file: WorkspaceFile) => void;
 }
 
 function ChatMessage({
   message,
   avatar,
   onCopy,
+  onViewFile,
+  onDownloadFile,
 }: ChatMessageProps) {
   const [copied, setCopied] = useState(false);
 
@@ -964,7 +1049,7 @@ function ChatMessage({
         <div className="zoya-small-avatar">
           <img
             src={avatar}
-            alt="Zoya"
+            alt="Aanya"
           />
         </div>
       )}
@@ -976,6 +1061,14 @@ function ChatMessage({
             onCopy={onCopy}
           />
         </div>
+
+        {message.filePath && message.fileKind === "file" && (
+          <WorkspaceFileCard
+            file={{ name: message.fileName || "Workspace file", path: message.filePath, kind: "file", size: message.fileSize }}
+            onView={onViewFile}
+            onDownload={onDownloadFile}
+          />
+        )}
 
         <div className="zoya-message-meta">
           <span>{time}</span>
@@ -993,6 +1086,76 @@ function ChatMessage({
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+function WorkspaceFileCard({
+  file,
+  onView,
+  onDownload,
+}: {
+  file: WorkspaceFile;
+  onView: (file: WorkspaceFile) => void;
+  onDownload: (file: WorkspaceFile) => void;
+}) {
+  return (
+    <div className="zoya-file-card">
+      <FileText size={18} />
+      <div className="zoya-file-card-info">
+        <strong>{file.name}</strong>
+        <small>{fileDetails(file)}</small>
+      </div>
+      <div className="zoya-file-card-actions">
+        <button type="button" onClick={() => onView(file)} aria-label={`View or read ${file.name}`}>
+          <Eye size={13} /> View / Read
+        </button>
+        <button type="button" onClick={() => onDownload(file)} aria-label={`Download ${file.name}`}>
+          <Download size={13} /> Download
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function fileDetails(file: WorkspaceFile) {
+  const extension = file.name.includes(".") ? file.name.split(".").pop()?.toUpperCase() : "FILE";
+  const size = typeof file.size === "number" ? ` · ${file.size < 1024 ? `${file.size} B` : `${Math.ceil(file.size / 1024)} KB`}` : "";
+  return `${extension || "FILE"}${size} · Workspace file`;
+}
+
+function WorkspaceViewer({
+  viewer,
+  onClose,
+  onDownload,
+}: {
+  viewer: {
+    file: WorkspaceFile;
+    status: "loading" | "ready" | "unavailable" | "error";
+    result?: WorkspaceFileReadResult;
+    error?: string;
+  };
+  onClose: () => void;
+  onDownload: (file: WorkspaceFile) => void;
+}) {
+  return (
+    <div className="zoya-workspace-overlay" role="dialog" aria-modal="true" aria-label={`Read ${viewer.file.name}`}>
+      <section className="zoya-workspace-viewer">
+        <header>
+          <div><FileText size={17} /><span>{viewer.file.name}</span></div>
+          <button type="button" onClick={onClose} aria-label="Close file viewer"><X size={17} /></button>
+        </header>
+        <div className="zoya-workspace-content">
+          {viewer.status === "loading" && <p>Loading latest saved file…</p>}
+          {viewer.status === "ready" && <pre><code>{viewer.result?.content}</code></pre>}
+          {viewer.status === "unavailable" && <p>Preview unavailable for this binary or large file. You can still download the actual file.</p>}
+          {viewer.status === "error" && <p>{viewer.error || "Unable to open this file."}</p>}
+        </div>
+        <footer>
+          <span>{viewer.result ? `${Math.ceil(viewer.result.size / 1024)} KB` : ""}</span>
+          <button type="button" onClick={() => onDownload(viewer.file)}><Download size={14} /> Download</button>
+        </footer>
+      </section>
     </div>
   );
 }
@@ -1148,26 +1311,65 @@ function CodeBlock({
 
 interface ChatInputProps {
   disabled: boolean;
-  onSend: (text: string) => void;
+  onSend: (text: string, attachments: ChatAttachment[]) => void;
+  onUpload: (attachment: ChatAttachment, data: string) => void;
 }
 
 function ChatInput({
   disabled,
   onSend,
+  onUpload,
 }: ChatInputProps) {
   const [value, setValue] =
     useState("");
+  const [attachment, setAttachment] = useState<ChatAttachment | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const readAttachment = async (file: File) => {
+    const maxSize = 25 * 1024 * 1024;
+    if (file.size > maxSize) {
+      setAttachment({ id: crypto.randomUUID(), name: file.name, mimeType: file.type || "application/octet-stream", size: file.size, status: "failed", error: "Files must be 25 MB or smaller." });
+      return;
+    }
+    const next: ChatAttachment = { id: crypto.randomUUID(), name: file.name, mimeType: file.type || "application/octet-stream", size: file.size, status: "uploading" };
+    setAttachment(next);
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      onUpload({ ...next, status: "ready" }, result.includes(",") ? result.slice(result.indexOf(",") + 1) : result);
+      setAttachment({ ...next, status: "ready" });
+    };
+    reader.onerror = () => setAttachment({ ...next, status: "failed", error: "Could not read this file." });
+    reader.readAsDataURL(file);
+  };
+
+  const chooseAttachment = async () => {
+    // Electron uses the native picker; browsers retain the standard input.
+    const nativeSelection = await window.electronAPI?.selectChatAttachment?.();
+    if (nativeSelection?.error) {
+      setAttachment({ id: crypto.randomUUID(), name: nativeSelection.name || "attachment", mimeType: nativeSelection.mimeType, size: nativeSelection.size || 0, status: "failed", error: nativeSelection.error });
+      return;
+    }
+    if (nativeSelection) {
+      const next: ChatAttachment = { id: crypto.randomUUID(), name: nativeSelection.name, mimeType: nativeSelection.mimeType, size: nativeSelection.size, status: "ready" };
+      setAttachment(next);
+      onUpload(next, nativeSelection.data);
+      return;
+    }
+    if (!window.electronAPI) fileInputRef.current?.click();
+  };
 
   const send = () => {
     const message = value.trim();
 
-    if (!message || disabled) {
+    if ((!message && !attachment) || disabled || attachment?.status === "uploading" || attachment?.status === "failed") {
       return;
     }
 
-    onSend(message);
+    onSend(message, attachment ? [attachment] : []);
 
     setValue("");
+    setAttachment(null);
   };
 
   const handleKeyDown = (
@@ -1182,6 +1384,7 @@ function ChatInput({
   return (
     <div className="zoya-chat-bottom">
       <div className="zoya-input-box">
+        <input ref={fileInputRef} type="file" className="zoya-file-picker" onChange={(event) => { const file = event.target.files?.[0]; if (file) void readAttachment(file); event.currentTarget.value = ""; }} />
         <input
           value={value}
           onChange={(event) =>
@@ -1190,24 +1393,29 @@ function ChatInput({
           onKeyDown={handleKeyDown}
           placeholder={
             disabled
-              ? "Start Zoya first..."
-              : "Message Zoya..."
+              ? "Start Aanya first..."
+              : "Message Aanya..."
           }
           disabled={disabled}
         />
 
+        <button type="button" className="zoya-attachment-button" onClick={() => void chooseAttachment()} disabled={disabled} title="Attach a file" aria-label="Attach a file">
+          <Plus size={17} />
+        </button>
         <button
           type="button"
           onClick={send}
           disabled={
             disabled ||
-            !value.trim()
+            (!value.trim() && !attachment) || attachment?.status === "uploading" || attachment?.status === "failed"
           }
           title="Send message"
         >
           <Send size={17} />
         </button>
       </div>
+
+      {attachment && <div className={`zoya-attachment ${attachment.status}`}><FileText size={13} /><span>{attachment.name}</span><small>{attachment.status === "uploading" ? "Uploading" : attachment.status === "ready" ? "Ready" : attachment.error || "Failed"}</small><button type="button" onClick={() => setAttachment(null)} aria-label="Remove attachment"><X size={13} /></button></div>}
 
       <div className="zoya-chat-hint">
         Press Enter to send

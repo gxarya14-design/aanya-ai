@@ -1,4 +1,4 @@
-import { app, BrowserWindow, desktopCapturer, ipcMain, shell, screen } from 'electron';
+import { app, BrowserWindow, desktopCapturer, ipcMain, shell, screen, dialog } from 'electron';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs/promises';
@@ -12,17 +12,17 @@ function createWindow() {
     height: 900,
     // FIX (window-identification bug): index.html previously had
     // <title>My Google AI Studio App</title> (a scaffolding leftover), so
-    // Zoya's own window never actually had "zoya" in its title despite
+    // Aanya's own window never actually had "aanya" in its title despite
     // every focusTargetWindow() exclusion check in server.ts assuming it
     // would. This `title` option is only what shows before the page loads
     // — once index.html's <title> tag is read, Electron's
     // 'page-title-updated' event fires and the PAGE's title wins on the
     // native window, not this one. The real, lasting fix is index.html's
-    // own <title> tag now also saying "Zoya" (see index.html) — that's
+    // own <title> tag now also saying "Aanya" (see index.html) — that's
     // what nut-js's getWindows()/getActiveWindow() actually reports.
-    // Keeping this option too just avoids a flash of "Zoya" -> "Electron"
-    // -> "Zoya" while the page is still loading.
-    title: 'Zoya',
+    // Keeping this option too just avoids a flash of "Aanya" -> "Electron"
+    // -> "Aanya" while the page is still loading.
+    title: 'Aanya',
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -150,6 +150,37 @@ ipcMain.handle('open-file-path', async (_event, filePath) => {
   } catch (error) {
     console.error('[ElectronMain] openFilePath failed:', error);
     return { ok: false, error: String(error?.message || error) };
+  }
+});
+
+// The renderer never receives arbitrary filesystem paths directly.  The
+// native picker is kept in the main process and only returns a user-selected
+// file, which is then read by the renderer for the current chat turn.
+ipcMain.handle('select-chat-attachment', async (event) => {
+  try {
+    const result = await dialog.showOpenDialog(BrowserWindow.fromWebContents(event.sender), {
+      title: 'Attach a file to Aanya',
+      properties: ['openFile'],
+    });
+    const filePath = result.filePaths[0];
+    if (result.canceled || !filePath) return null;
+    const stats = await fs.stat(filePath);
+    const maxBytes = 25 * 1024 * 1024;
+    if (!stats.isFile() || stats.size > maxBytes) {
+      return { error: stats.isFile() ? 'Files must be 25 MB or smaller.' : 'Please select a file.' };
+    }
+    const data = await fs.readFile(filePath);
+    return {
+      name: path.basename(filePath),
+      size: stats.size,
+      // The server determines supported handling from content/type safely;
+      // Electron deliberately does not infer an executable MIME type here.
+      mimeType: 'application/octet-stream',
+      data: data.toString('base64'),
+    };
+  } catch (error) {
+    console.error('[ElectronMain] selectChatAttachment failed:', error);
+    return null;
   }
 });
 

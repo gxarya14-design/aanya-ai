@@ -60,7 +60,7 @@ export const VoiceControls: React.FC<VoiceControlsProps> = ({
               : '0 0 15px rgba(0,0,0,0.5)',
             border: `2px solid ${isConnected ? themeColor : '#475569'}`,
           }}
-          title={isConnected ? 'Disconnect Zoya' : 'Connect Zoya Live'}
+          title={isConnected ? 'Disconnect Aanya' : 'Connect Aanya Live'}
         >
           {/* Glow Ring */}
           <span
@@ -90,7 +90,7 @@ export const VoiceControls: React.FC<VoiceControlsProps> = ({
               ? 'bg-amber-500/20 text-amber-300 border-amber-500/60 hover:bg-amber-500/30 shadow-amber-500/20'
               : 'bg-slate-800/80 text-pink-400 border-slate-700 hover:border-pink-500/50 hover:bg-slate-700/80'
           }`}
-          title={isScreenSharing ? 'Stop Screen Sharing' : 'Share Screen with Zoya Vision'}
+          title={isScreenSharing ? 'Stop Screen Sharing' : 'Share Screen with Aanya Vision'}
         >
           {isScreenSharing ? (
             <MonitorOff className="w-5 h-5 text-amber-300 animate-pulse" />

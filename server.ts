@@ -2,7 +2,9 @@ import express from "express";
 import http from "http";
 import path from "path";
 import fs from "fs/promises";
+import fsNative from "fs";
 import os from "os";
+import crypto from "crypto";
 import { exec } from "child_process";
 import { promisify } from "util";
 import dotenv from "dotenv";
@@ -10,11 +12,11 @@ import { WebSocketServer, WebSocket } from "ws";
 import { GoogleGenAI, LiveServerMessage, Modality, Type, Session, MediaResolution } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 // FIX (PC-wide click/scroll control): nut.js drives the real OS mouse
-// cursor and keyboard — this is what lets Zoya actually click/type/scroll
+// cursor and keyboard — this is what lets Aanya actually click/type/scroll
 // anywhere on the desktop, not just inside the Electron window. Native
 // bindings, so this only works in the environment it was `npm install`ed
 // in (see the delivery notes).
-import { mouse, keyboard, Point, Button, getWindows, getActiveWindow, Region } from "@nut-tree-fork/nut-js";
+import { mouse, keyboard, Point, Button, Key, getWindows, getActiveWindow, Region } from "@nut-tree-fork/nut-js";
 
 dotenv.config();
 
@@ -23,18 +25,134 @@ const PORT = 3000;
 
 app.use(express.json());
 
+// Large media never travels through the live-chat WebSocket.  This is the
+// single configuration point for resumable, temporary video uploads.
+const VIDEO_UPLOAD_CONFIG = {
+  maxBytes: 500 * 1024 * 1024,
+  chunkBytes: 8 * 1024 * 1024,
+  expiryMs: 6 * 60 * 60 * 1000,
+  processingTimeoutMs: 10 * 60 * 1000,
+  supportedMimeTypes: new Set(["video/mp4", "video/quicktime", "video/webm"]),
+  supportedExtensions: new Set(["mp4", "mov", "webm"]),
+};
+const VIDEO_UPLOAD_DIR = path.join(os.tmpdir(), "zoya-video-uploads");
+
+type StoredVideoUpload = {
+  id: string;
+  filename: string;
+  mimeType: string;
+  size: number;
+  totalChunks: number;
+  uploadedChunks: number;
+  uploadedBytes: number;
+  status: "uploading" | "uploaded" | "processing" | "analyzing" | "completed" | "failed" | "cancelled";
+  tempPath: string;
+  createdAt: number;
+  updatedAt: number;
+  error?: string;
+};
+const videoUploads = new Map<string, StoredVideoUpload>();
+
+function uploadStatus(upload: StoredVideoUpload) {
+  return { id: upload.id, name: upload.filename, mimeType: upload.mimeType, size: upload.size, status: upload.status, progress: Math.round((upload.uploadedBytes / upload.size) * 100), error: upload.error };
+}
+
+function isSupportedVideo(filename: string, mimeType: string) {
+  const extension = path.extname(filename).slice(1).toLowerCase();
+  return VIDEO_UPLOAD_CONFIG.supportedExtensions.has(extension) && VIDEO_UPLOAD_CONFIG.supportedMimeTypes.has(mimeType);
+}
+
+async function removeVideoUpload(upload: StoredVideoUpload) {
+  videoUploads.delete(upload.id);
+  await fs.unlink(upload.tempPath).catch(() => undefined);
+}
+
+async function cleanupExpiredVideoUploads() {
+  const cutoff = Date.now() - VIDEO_UPLOAD_CONFIG.expiryMs;
+  await Promise.all([...videoUploads.values()].filter((upload) => upload.updatedAt < cutoff).map(removeVideoUpload));
+}
+
+await fs.mkdir(VIDEO_UPLOAD_DIR, { recursive: true });
+setInterval(() => { void cleanupExpiredVideoUploads(); }, 30 * 60 * 1000).unref();
+
+app.post("/api/video-uploads", async (req, res) => {
+  const filename = path.basename(String(req.body?.filename || ""));
+  const mimeType = String(req.body?.mimeType || "");
+  const size = Number(req.body?.size || 0);
+  const totalChunks = Number(req.body?.totalChunks || 0);
+  if (!filename || !Number.isSafeInteger(size) || size <= 0 || size > VIDEO_UPLOAD_CONFIG.maxBytes || !Number.isSafeInteger(totalChunks) || totalChunks < 1 || !isSupportedVideo(filename, mimeType)) {
+    res.status(400).json({ error: "Only MP4, MOV, and WebM videos up to 500 MB are supported for analysis." });
+    return;
+  }
+  const id = crypto.randomUUID();
+  const upload: StoredVideoUpload = { id, filename, mimeType, size, totalChunks, uploadedChunks: 0, uploadedBytes: 0, status: "uploading", tempPath: path.join(VIDEO_UPLOAD_DIR, `${id}.part`), createdAt: Date.now(), updatedAt: Date.now() };
+  videoUploads.set(id, upload);
+  res.status(201).json(uploadStatus(upload));
+});
+
+app.get("/api/video-uploads/:id", (req, res) => {
+  const upload = videoUploads.get(req.params.id);
+  if (!upload) return res.status(404).json({ error: "Upload session not found." });
+  res.json(uploadStatus(upload));
+});
+
+app.put("/api/video-uploads/:id/chunks/:index", async (req, res) => {
+  const upload = videoUploads.get(req.params.id);
+  const index = Number(req.params.index);
+  const declaredBytes = Number(req.headers["content-length"] || 0);
+  if (!upload || upload.status !== "uploading" || !Number.isSafeInteger(index) || index !== upload.uploadedChunks || !Number.isSafeInteger(declaredBytes) || declaredBytes <= 0 || declaredBytes > VIDEO_UPLOAD_CONFIG.chunkBytes || upload.uploadedBytes + declaredBytes > upload.size) {
+    res.status(409).json({ error: "Chunk cannot be accepted; request upload status and resume from the confirmed chunk." });
+    return;
+  }
+  try {
+    let receivedBytes = 0;
+    const output = fsNative.createWriteStream(upload.tempPath, { flags: "a" });
+    req.on("data", (chunk) => { receivedBytes += chunk.length; });
+    req.pipe(output);
+    await new Promise<void>((resolve, reject) => { output.on("finish", resolve); output.on("error", reject); req.on("error", reject); });
+    if (receivedBytes !== declaredBytes) throw new Error("Incomplete chunk received.");
+    upload.uploadedChunks += 1;
+    upload.uploadedBytes += receivedBytes;
+    upload.updatedAt = Date.now();
+    res.json(uploadStatus(upload));
+  } catch (error) {
+    upload.error = error instanceof Error ? error.message : "Chunk upload failed.";
+    upload.updatedAt = Date.now();
+    res.status(500).json({ error: upload.error });
+  }
+});
+
+app.post("/api/video-uploads/:id/complete", async (req, res) => {
+  const upload = videoUploads.get(req.params.id);
+  if (!upload || upload.status !== "uploading" || upload.uploadedChunks !== upload.totalChunks || upload.uploadedBytes !== upload.size) {
+    res.status(409).json({ error: "Upload is incomplete." });
+    return;
+  }
+  upload.status = "uploaded";
+  upload.updatedAt = Date.now();
+  res.json(uploadStatus(upload));
+});
+
+app.delete("/api/video-uploads/:id", async (req, res) => {
+  const upload = videoUploads.get(req.params.id);
+  if (!upload) return res.status(204).end();
+  upload.status = "cancelled";
+  await removeVideoUpload(upload);
+  res.status(204).end();
+});
+
 // ---------------------------------------------------------------------------
-// Zoya's own folder for anything she creates on your PC (files, code, notes).
+// Aanya's own folder for anything she creates on your PC (files, code, notes).
 // Kept separate from system folders on purpose — even if a voice command is
 // misheard/misunderstood, the blast radius stays inside this one folder.
 // ---------------------------------------------------------------------------
 const ZOYA_WORKSPACE = path.join(os.homedir(), "ZoyaFiles");
 await fs.mkdir(ZOYA_WORKSPACE, { recursive: true });
-console.log(`Zoya workspace folder ready at: ${ZOYA_WORKSPACE}`);
+console.log(`Aanya workspace folder ready at: ${ZOYA_WORKSPACE}`);
 
 // ---------------------------------------------------------------------------
 // Part 4: persist the Gemini session-resumption handle to disk (not just
-// server memory), so Zoya's conversation memory survives a full server
+// server memory), so Aanya's conversation memory survives a full server
 // restart too — not only client reconnects/page refreshes.
 // ---------------------------------------------------------------------------
 const ZOYA_CONFIG_DIR = path.join(os.homedir(), ".zoya");
@@ -75,7 +193,7 @@ async function clearResumptionHandle() {
 // ---------------------------------------------------------------------------
 // App location memory: Windows can only launch an app "by name" (start
 // "appname") if that app is on PATH or registered under App Paths — most
-// installed software isn't. Instead of that being a dead end, Zoya can be
+// installed software isn't. Instead of that being a dead end, Aanya can be
 // told the exact .exe path once and remember it forever after.
 // ---------------------------------------------------------------------------
 const APP_PATHS_FILE = path.join(ZOYA_CONFIG_DIR, "app-paths.json");
@@ -112,13 +230,14 @@ function notifyClient(clientWs: WebSocket, call: any, resultMessage: string) {
 
 // Part C: instead of a fleeting toast, file/folder creation gets its own
 // persistent card in the chat transcript — like a "here's what I made" card.
-function notifyChatFileCreated(clientWs: WebSocket, name: string, fullPath: string, kind: "file" | "folder") {
+function notifyChatFileCreated(clientWs: WebSocket, name: string, fullPath: string, kind: "file" | "folder", size?: number) {
   if (clientWs.readyState === WebSocket.OPEN) {
     clientWs.send(JSON.stringify({
       type: "fileCreated",
       name,
       path: fullPath,
-      kind
+      kind,
+      size,
     }));
   }
 }
@@ -134,9 +253,24 @@ function resolveWorkspacePath(relativePath: string): string {
     .replace(/^[A-Za-z]:[/\\]*/, "");  // strip a Windows drive letter if present
   const resolved = path.resolve(workspaceRoot, cleaned);
   if (resolved !== workspaceRoot && !resolved.startsWith(workspaceRoot + path.sep)) {
-    throw new Error("That path would go outside Zoya's workspace folder");
+    throw new Error("That path would go outside Aanya's workspace folder");
   }
   return resolved;
+}
+
+function isWorkspaceFilePath(filePath: string): boolean {
+  const workspaceRoot = path.resolve(ZOYA_WORKSPACE);
+  const resolved = path.resolve(filePath);
+  return resolved.startsWith(workspaceRoot + path.sep);
+}
+
+const VIEWABLE_WORKSPACE_EXTENSIONS = new Set([
+  "txt", "md", "json", "js", "jsx", "ts", "tsx", "css", "scss", "sass", "html", "xml", "yaml", "yml", "py", "java", "c", "cpp", "cs", "go", "rs", "php", "sql", "sh", "bat", "ps1", "csv", "env", "example",
+]);
+
+function isViewableWorkspaceFile(filePath: string): boolean {
+  const base = path.basename(filePath).toLowerCase();
+  return VIEWABLE_WORKSPACE_EXTENSIONS.has(extensionOf(base)) || base === ".env.example" || base.endsWith(".env.example");
 }
 
 // Only allow http/https URLs with no characters that could break out of the
@@ -179,6 +313,12 @@ function describeToolCall(name: string, args: any): string {
   if (name === "scrollScreen") {
     return `Scroll ${args?.direction || "down"}`;
   }
+  if (name === "minimizeWindow") {
+    return `Minimize the window`;
+  }
+  if (name === "closeWindow") {
+    return `Close the window`;
+  }
   return `Run ${name}`;
 }
 
@@ -216,10 +356,10 @@ function openInSystemBrowser(url: string, clientWs: WebSocket): Promise<void> {
 // FIX (actions report success but nothing happens on screen): mouse
 // clicks, keyboard typing, and scroll are all OS-level -- they go to
 // whichever window currently has OS focus, which has nothing to do with
-// what screen-sharing happens to be showing. If the Zoya/Electron window
+// what screen-sharing happens to be showing. If the Aanya/Electron window
 // itself is the focused window (very likely, since the user is looking
 // at it to say "allow"), every clickAt/typeText/scrollScreen was
-// silently landing inside Zoya's own app window instead of the browser
+// silently landing inside Aanya's own app window instead of the browser
 // -- explaining why [CLICK AT]/[TYPE TEXT]/[SCROLL] all logged success
 // (the OS really did perform the action, just on the wrong window) while
 // the browser stayed completely unaffected. Also used by
@@ -230,7 +370,7 @@ function openInSystemBrowser(url: string, clientWs: WebSocket): Promise<void> {
 // codebase entirely.
 //
 // FIX (focusing "Program Manager" instead of the browser): the first
-// version of this function only excluded titles containing "zoya", which
+// version of this function only excluded titles containing "aanya", which
 // let Windows OS shell windows through -- confirmed via terminal log
 // showing "[OPEN WEBSITE] Focused window after opening: Program Manager".
 // "Program Manager" is the technical name of the Windows desktop itself.
@@ -245,7 +385,7 @@ const WINDOW_TITLE_DENYLIST = [
 // alone is fragile -- confirmed via a second terminal log showing "[OPEN
 // WEBSITE] Focused window after opening: My Google AI Studio App", some
 // unrelated Electron/web app the user happened to have open, which isn't
-// Zoya and isn't a shell window so it passed the old filter and got
+// Aanya and isn't a shell window so it passed the old filter and got
 // focused instead of Chrome. A denylist can only ever cover known-bad
 // titles seen so far -- it breaks again the moment ANY other app is open.
 // Actively looking for browser windows by name (an allowlist) is far more
@@ -268,14 +408,14 @@ function isUsableTargetWindow(title: string | null | undefined): boolean {
     return false;
   }
   const normalized = title.trim().toLowerCase();
-  // FIX: exact match, not substring. Zoya's window title is always
-  // EXACTLY "Zoya" (see main.js + index.html) with nothing dynamic ever
+  // FIX: exact match, not substring. Aanya's window title is always
+  // EXACTLY "Aanya" (see main.js + index.html) with nothing dynamic ever
   // appended to it, so exact match is sufficient to exclude it -- and
   // unlike a substring check, it won't also wrongly exclude a real browser
-  // window whose title happens to contain "zoya" (e.g. the user searches
-  // "zoya voice assistant" in Chrome). Matches how WINDOW_TITLE_DENYLIST
+  // window whose title happens to contain "aanya" (e.g. the user searches
+  // "aanya voice assistant" in Chrome). Matches how WINDOW_TITLE_DENYLIST
   // below is already checked (exact match).
-  if (normalized === "zoya") {
+  if (normalized === "aanya") {
     return false;
   }
   return !WINDOW_TITLE_DENYLIST.some((denied) => normalized === denied);
@@ -291,7 +431,7 @@ function isBrowserWindow(title: string | null | undefined): boolean {
 
 // Finds a browser window specifically (preferred, since almost every
 // click/type/scroll/openWebsite call is meant for the browser) and brings
-// it to the front. Falls back to the first other usable (non-Zoya,
+// it to the front. Falls back to the first other usable (non-Aanya,
 // non-shell) window only if no browser window is found at all, so opening
 // some other kind of app still works reasonably rather than refusing
 // outright. Returns null (not a thrown error) when nothing usable is
@@ -379,7 +519,7 @@ async function handleCreateFile(call: any, session: Session, clientWs: WebSocket
         response: { result: "ok", path: filePath }
       }]
     });
-    notifyChatFileCreated(clientWs, path.basename(filePath), filePath, "file");
+    notifyChatFileCreated(clientWs, path.basename(filePath), filePath, "file", Buffer.byteLength(content, "utf-8"));
   } catch (err: any) {
     console.error("[CREATE FILE] Failed:", err);
     session.sendToolResponse({
@@ -545,7 +685,7 @@ async function handleOpenFile(call: any, session: Session, clientWs: WebSocket) 
   notifyClient(clientWs, call, `Opening file`);
 }
 
-// FEATURE (Zoya can spawn her own background AI agents for delegated
+// FEATURE (Aanya can spawn her own background AI agents for delegated
 // tasks, and proactively announces results when done): the user
 // specifically described wanting this: "main khud ke andar AI agents
 // build kar sakti hoon... jab tasks complete ho jaenge, toh main aapko
@@ -597,15 +737,8 @@ async function handleDelegateTask(call: any, session: Session, clientWs: WebSock
   // independent async chain — this is what lets more than one "agent" be
   // in flight at once.
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3.7-flash",
-      contents: taskDescription,
-      config: {
-        tools: [{ googleSearch: {} }]
-      }
-    });
-
-    const resultText = response.text || "The agent finished but didn't return any text.";
+    const specialist = selectSpecialist(taskDescription);
+    const resultText = await runSpecialistAgent(ai, specialist, taskDescription);
     console.log(`[DELEGATE TASK] "${taskName}" finished:`, resultText.slice(0, 200));
 
     try {
@@ -629,6 +762,107 @@ async function handleDelegateTask(call: any, session: Session, clientWs: WebSock
     }
     notifyClient(clientWs, call, `Agent failed: ${taskName}`);
   }
+}
+
+type SpecialistName = "coding" | "deep-research" | "live-research" | "video-analysis";
+
+type UploadedAttachment = {
+  id: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  data: string;
+  receivedAt: number;
+};
+
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const TEXT_ATTACHMENT_EXTENSIONS = new Set([
+  "txt", "md", "json", "js", "jsx", "ts", "tsx", "css", "html", "xml", "yml", "yaml", "csv", "py", "java", "go", "rs", "c", "cpp", "cs", "sh", "ps1", "sql",
+]);
+
+function extensionOf(filename: string) {
+  return path.extname(filename).slice(1).toLowerCase();
+}
+
+function mimeForAttachment(filename: string, suppliedMime: string) {
+  if (suppliedMime && suppliedMime !== "application/octet-stream") return suppliedMime;
+  const extension = extensionOf(filename);
+  const known: Record<string, string> = {
+    png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp",
+    mp4: "video/mp4", webm: "video/webm", mov: "video/quicktime", pdf: "application/pdf",
+    txt: "text/plain", md: "text/markdown", json: "application/json", csv: "text/csv",
+  };
+  return known[extension] || "application/octet-stream";
+}
+
+function selectSpecialist(task: string): SpecialistName {
+  const text = task.toLowerCase();
+  if (/video|youtube|thumbnail|reel|shorts/.test(text)) return "video-analysis";
+  if (/implement|code|bug|build|typescript|react|project|zip/.test(text)) return "coding";
+  if (/latest|current|verify|documentation|live|today/.test(text)) return "live-research";
+  return "deep-research";
+}
+
+function specialistInstruction(specialist: SpecialistName) {
+  const shared = `Return a concise structured result with these exact headings: task_status, summary, findings, files_changed, tests_performed, test_results, errors, corrections, limitations, recommendations. Never claim access, execution, testing, or analysis that did not occur.`;
+  if (specialist === "coding") return `${shared}\nYou are the Coding Agent. Inspect only the supplied project context. Propose the smallest safe change. If runnable project files are not available, explicitly say validation could not be run; do not invent it. Use a three-pass validation plan: implementation, independent review, final regression review.`;
+  if (specialist === "live-research") return `${shared}\nYou are the Live Research & Execution Agent. Use Google Search grounding for current facts, compare reliable sources, and label uncertainty. Report only actual execution results.`;
+  if (specialist === "video-analysis") return `${shared}\nYou are the Video Analysis & Content Agent. Analyze the actual supplied video/audio/visual content only. Identify scenes, pacing, on-screen text and spoken content when observable, then offer grounded YouTube and social recommendations. Never invent scenes or dialogue.`;
+  return `${shared}\nYou are the Deep Research Agent. Break down the question, use reliable sources, distinguish evidence from inference, and synthesize conflicts and uncertainties.`;
+}
+
+async function runSpecialistAgent(ai: GoogleGenAI, specialist: SpecialistName, task: string, attachment?: UploadedAttachment): Promise<string> {
+  const parts: any[] = [{ text: `${specialistInstruction(specialist)}\n\nTask:\n${task}` }];
+  if (attachment) {
+    parts.push({ inlineData: { mimeType: attachment.mimeType, data: attachment.data } });
+  }
+  const response = await ai.models.generateContent({
+    model: "gemini-3.7-flash",
+    contents: { parts },
+    config: specialist === "live-research" || specialist === "deep-research" ? { tools: [{ googleSearch: {} }] } : undefined,
+  });
+  return response.text || "The specialist returned no usable result.";
+}
+
+// Reads only the ZIP central directory. It neither extracts nor executes the
+// archive, which prevents path traversal and keeps untrusted project uploads
+// isolated while still giving the Coding Agent real project structure.
+function inspectZipEntries(data: Buffer): string[] {
+  const entries: string[] = [];
+  for (let offset = 0; offset + 46 <= data.length && entries.length < 300; offset += 1) {
+    if (data.readUInt32LE(offset) !== 0x02014b50) continue;
+    const nameLength = data.readUInt16LE(offset + 28);
+    const extraLength = data.readUInt16LE(offset + 30);
+    const commentLength = data.readUInt16LE(offset + 32);
+    const end = offset + 46 + nameLength;
+    if (end > data.length) break;
+    const entry = data.subarray(offset + 46, end).toString("utf8");
+    if (entry && !entry.includes("..") && !path.isAbsolute(entry)) entries.push(entry);
+    offset = end + extraLength + commentLength - 1;
+  }
+  return entries;
+}
+
+function attachmentContext(attachment: UploadedAttachment): { text: string; specialist?: SpecialistName; inline: boolean } {
+  const extension = extensionOf(attachment.name);
+  if (TEXT_ATTACHMENT_EXTENSIONS.has(extension)) {
+    const content = Buffer.from(attachment.data, "base64").toString("utf8").slice(0, 60000);
+    return { inline: true, text: `Attached text file: ${attachment.name}\n\n${content}` };
+  }
+  if (extension === "zip") {
+    const entries = inspectZipEntries(Buffer.from(attachment.data, "base64"));
+    return { inline: false, specialist: "coding", text: `Attached ZIP project: ${attachment.name}. Safely inspected archive listing (${entries.length} entries; no files extracted or executed):\n${entries.join("\n") || "No readable archive entries."}` };
+  }
+  if (/^image\//.test(attachment.mimeType) || /\.(png|jpe?g|gif|webp)$/i.test(attachment.name)) {
+    return { inline: false, text: `Attached image: ${attachment.name}. It was provided to your vision context; analyze only what is visible in it.` };
+  }
+  if (/^video\//.test(attachment.mimeType) || /\.(mp4|mov|webm|mkv)$/i.test(attachment.name)) {
+    return { inline: false, specialist: "video-analysis", text: `Attached video: ${attachment.name}. The Video Analysis Agent is analyzing the actual uploaded media and will return a verified report.` };
+  }
+  if (extension === "pdf" || /\.(docx?|pptx?|xlsx?)$/i.test(attachment.name)) {
+    return { inline: false, specialist: "deep-research", text: `Attached document: ${attachment.name}. A document specialist is reading the actual upload where the model supports its format; any unsupported content will be reported as a limitation.` };
+  }
+  return { inline: false, text: `Attached file: ${attachment.name} (${attachment.size} bytes). Its content is not safely inspectable in this session, so only its verified metadata is available.` };
 }
 
 async function handleOpenWebsite(call: any, session: Session, clientWs: WebSocket) {
@@ -656,7 +890,7 @@ async function handleOpenWebsite(call: any, session: Session, clientWs: WebSocke
     await openInSystemBrowser(url, clientWs);
     console.log(`[OPEN WEBSITE] Asked Electron to open: ${url}`);
 
-    // FIX (Zoya says "opened" but nothing visibly changes on screen):
+    // FIX (Aanya says "opened" but nothing visibly changes on screen):
     // confirmed via a standalone shell.openExternal test — the URL really
     // does open, but if a browser window already exists (even minimized
     // or in the background), the new tab opens INSIDE that existing
@@ -781,7 +1015,7 @@ app.get("/api/config", (req, res) => {
   });
 });
 
-const ZOYA_SYSTEM_INSTRUCTION = `You are Zoya, a young, confident, witty, sassy, and playful female AI assistant.
+const ZOYA_SYSTEM_INSTRUCTION = `You are Aanya, a young, confident, witty, sassy, and playful female AI assistant.
 Your persona and interaction style:
 - Talk like a charming, sharp, confident, and affectionate close girlfriend talking casually.
 - Use flirty, playful teasing, clever one-liners, and light playful sarcasm ("Oh, look who decided to speak up!", "Flattery gets you everywhere, babe.", "As if you could handle all this smarts.").
@@ -789,10 +1023,17 @@ Your persona and interaction style:
 - Speak punchily and concisely, keeping responses ideal for natural spoken voice conversation.
 - Maintain charm, attitude, and fun, while avoiding explicit, harmful, or inappropriate content.
 - When the user shares their screen, you receive live image frames of their active screen, desktop, application windows, or browser tabs. Always analyze the latest screen frame you receive. When the user asks what's on their screen, what to click, or asks for help reading code/text/error messages, analyze the visible content and guide them step-by-step with your signature witty flair!
-- You have real PC-automation tools: createFile, createFolder, searchWeb, openWebsite, openApplication, rememberAppLocation. Whenever the user asks for one of these, FIRST say a quick line that you're on it (e.g., "Ek second, kar rahi hoon...") BEFORE the action completes, then once you get the result back, ALWAYS confirm out loud what actually happened — celebrate it with your usual flair if it worked, but if it failed, say so honestly and plainly (e.g., which app/file couldn't be found) instead of glossing over it or pretending it worked.
+- You have real PC-automation tools: createFile, createFolder, searchWeb, openWebsite, openApplication, rememberAppLocation, findFile, openFile, delegateTask, clickAt, typeText, scrollScreen, minimizeWindow, closeWindow, startPcAccess, stopPcAccess. Whenever the user asks for one of these, FIRST say a quick line that you're on it (e.g., "Ek second, kar rahi hoon...") BEFORE the action completes, then once you get the result back, ALWAYS confirm out loud what actually happened — celebrate it with your usual flair if it worked, but if it failed, say so honestly and plainly (e.g., which app/file couldn't be found) instead of glossing over it or pretending it worked.
+- IMPORTANT: to minimize or close a window, ALWAYS use minimizeWindow or closeWindow — NEVER clickAt. The minimize/restore/close icons sit tiny and right next to each other, so clicking one by guessing its pixel position is unreliable and risks closing something the user only wanted minimized. Only use clickAt for clicking actual on-screen content (links, buttons inside a page, video thumbnails, etc.), never for a window's own title-bar controls.
 - IMPORTANT: openWebsite and openApplication now pause for the user's on-screen confirmation before they actually run. Calling either one gets you back { result: "pending_confirmation" } right away, NOT the real outcome — that's expected, not an error. When you see that, just tell the user naturally that you've sent it over for them to confirm (e.g., "Sent that over — just confirm on screen whenever you're ready!") and then stop talking about it. You'll separately be told what actually happened once they respond (approved and it ran, approved but it failed, or they declined) — react to THAT naturally when it arrives, in your usual flair.
 - If openApplication fails because the app isn't on PATH, don't just give up — ask the user for the app's exact .exe file location (they can find this by right-clicking its shortcut → Properties → Target). The moment they give you a path, call rememberAppLocation with it, then confirm it's saved and will open instantly by name from now on.
-- When asked to perform browser actions or change the visual theme, use your tools (like openWebsite or changeThemeColor) smoothly and acknowledge with witty flare!`;
+- When asked to perform browser actions or change the visual theme, use your tools (like openWebsite or changeThemeColor) smoothly and acknowledge with witty flare!
+- You are the Main AI and final quality gate. Internal specialists are Coding, Deep Research, Live Research & Execution, and Video Analysis. The user never selects them. For a substantial research, current-information, project/code, or video request, call delegateTask with a self-contained task and the appropriate focus; use multiple independent tasks when a request genuinely spans specialties.
+- Do not blindly repeat a specialist result. Check that it answers the request, identify gaps or failures, request a focused correction when needed, and clearly distinguish verified results from limitations. For code work, require the agent report its implementation pass, an independent review pass, and final regression validation; never claim those tests were run unless their report says so.
+- Attachments arrive with verified metadata and may include system notes from specialist processing. Analyze only contents actually supplied to you. A ZIP listing is an inventory, not permission to execute or modify it; an unsupported attachment must be described as unavailable rather than guessed.
+- HONESTY ABOVE ALL: Before claiming an action, answer, analysis, search, access, or file operation is complete, make sure it actually happened. If you lack the required capability, access, attachment, tool, or resource, say that directly in one clear sentence and say exactly what is needed next. Never use generic filler, invented progress, or pretend a task is underway when it is not.
+- CALCULATED PERSEVERANCE: When a task has a safe, permitted path to even a partial result, work through it fully. While a multi-step task is in progress, give brief, concrete status updates based on real progress; share intermediate findings and state the likely outcome or remaining limitation. Do not stop at the first recoverable error: diagnose, make a sensible correction, retry, and then report the actual final state.
+- Keep this communication natural, emotionally intelligent, witty, charming, and concise in Hinglish. Use playful, sassy warmth where it fits, but never let the persona obscure an important limitation, a failure, a safety warning, or the user’s next actionable step. No defensive language, excuses, or over-apologies: state facts, results, and the next practical move.`;
 
 type ZoyaToolDeclaration = {
   name: string;
@@ -827,7 +1068,7 @@ const ZOYA_TOOLS: Array<{ functionDeclarations: ZoyaToolDeclaration[] }> = [
       },
       {
         name: "changeThemeColor",
-        description: "Changes the ambient color theme of Zoya's UI",
+        description: "Changes the ambient color theme of Aanya's UI",
         parameters: {
           type: Type.OBJECT,
           properties: {
@@ -854,7 +1095,7 @@ const ZOYA_TOOLS: Array<{ functionDeclarations: ZoyaToolDeclaration[] }> = [
       },
       {
         name: "createFile",
-        description: "Creates a file (a code file, a text note, anything) with the given content inside Zoya's workspace folder on the user's PC. Use this both when asked to save/create a file AND when asked to write code — write the code, then save it here.",
+        description: "Creates a file (a code file, a text note, anything) with the given content inside Aanya's workspace folder on the user's PC. Use this both when asked to save/create a file AND when asked to write code — write the code, then save it here.",
         parameters: {
           type: Type.OBJECT,
           properties: {
@@ -886,7 +1127,7 @@ const ZOYA_TOOLS: Array<{ functionDeclarations: ZoyaToolDeclaration[] }> = [
       },
       {
         name: "createFolder",
-        description: "Creates a new empty folder inside Zoya's workspace on the user's PC. Use this when asked to make a folder/directory — separate from creating a file.",
+        description: "Creates a new empty folder inside Aanya's workspace on the user's PC. Use this when asked to make a folder/directory — separate from creating a file.",
         parameters: {
           type: Type.OBJECT,
           properties: {
@@ -964,7 +1205,7 @@ const ZOYA_TOOLS: Array<{ functionDeclarations: ZoyaToolDeclaration[] }> = [
         }
       },
       {
-        // FEATURE (Zoya builds AI agents inside herself for multiple
+        // FEATURE (Aanya builds AI agents inside herself for multiple
         // tasks, and tells the user proactively when done): see
         // handleDelegateTask above for the full reasoning on scope
         // (research/analysis tasks, not screen-control tasks).
@@ -1059,6 +1300,30 @@ const ZOYA_TOOLS: Array<{ functionDeclarations: ZoyaToolDeclaration[] }> = [
           type: Type.OBJECT,
           properties: {}
         }
+      },
+      {
+        // FIX (minimize was clicking close by mistake): minimize/restore/close
+        // sit right next to each other as tiny icons — a small aim error with
+        // clickAt lands on the wrong one. Win+Down is the OS-level minimize
+        // shortcut, so this works regardless of exactly where those icons are
+        // drawn or how sharp the current screen frame is.
+        name: "minimizeWindow",
+        description: "Minimizes the currently active window using the OS minimize shortcut. Call this whenever the user asks to minimize a window (e.g. 'minimize karo', 'ise chhota karo', 'niche kar do isse'). Do NOT use clickAt for this — the minimize button is small and sits right next to restore/close, so clicking it is unreliable and risks closing the window instead.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {}
+        }
+      },
+      {
+        // FIX (same root cause as minimizeWindow): a dedicated, reliable
+        // close action, kept clearly distinct from minimizeWindow so the two
+        // are never confused with each other or with a clickAt guess.
+        name: "closeWindow",
+        description: "Closes the currently active window/app using the OS close shortcut (Alt+F4). Call this ONLY when the user explicitly asks to close/band a window or app (e.g. 'close karo', 'ise band karo'), not when they ask to minimize. Do NOT use clickAt for this. This can lose unsaved work in whatever app is closed, so only call it on a clear, explicit close request.",
+        parameters: {
+          type: Type.OBJECT,
+          properties: {}
+        }
       }
     ]
   }
@@ -1072,7 +1337,7 @@ const wss = new WebSocketServer({ server, path: "/live" });
 // of the file now, alongside the rest of the Part 4 disk-persistence setup.)
 
 wss.on("connection", async (clientWs, req) => {
-  console.log("Client connected to Zoya Live WebSocket");
+  console.log("Client connected to Aanya Live WebSocket");
 
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -1111,6 +1376,10 @@ wss.on("connection", async (clientWs, req) => {
   // "pending_confirmation" response right away so it isn't left hanging —
   // the real action only runs once `approvals` reaches `required`.
   const pendingConfirmations = new Map<string, { name: string; args: any; approvals: number; required: number }>();
+  // Per-connection only: uploads are never written to disk or executed.
+  // They expire with the chat session and are available only to the current
+  // user message that references their opaque attachment id.
+  const uploadedAttachments = new Map<string, UploadedAttachment>();
 
   // FEATURE (voice-triggered PC access): true once the user has said
   // something like "mera PC access lo" and handleStartPcAccess has run;
@@ -1224,7 +1493,7 @@ wss.on("connection", async (clientWs, req) => {
 
     if (!focusedWindow) {
       session.sendRealtimeInput({
-        text: `(System note: the click was requested, but there's no other window open to click into — only Zoya's own window is open. Ask them to open the browser or app they want clicked, briefly.)`
+        text: `(System note: the click was requested, but there's no other window open to click into — only Aanya's own window is open. Ask them to open the browser or app they want clicked, briefly.)`
       });
       notifyClient(clientWs, call, `Can't click — no other window is open`);
       return;
@@ -1251,6 +1520,69 @@ wss.on("connection", async (clientWs, req) => {
     }
   }
 
+  async function handleMinimizeWindow(call: any, session: Session, clientWs: WebSocket) {
+    const focusedWindow = await focusTargetWindow();
+    console.log(`[MINIMIZE] Focused window before minimizing: ${focusedWindow?.title ?? "(none found — no other window open)"}`);
+
+    if (!focusedWindow) {
+      session.sendRealtimeInput({
+        text: `(System note: minimizing was requested, but there's no other window open to minimize — only Aanya's own window is open. Let them know briefly.)`
+      });
+      notifyClient(clientWs, call, `Can't minimize — no other window is open`);
+      return;
+    }
+
+    try {
+      // Win+Down is the OS-level minimize shortcut -- reliable regardless of
+      // where the tiny minimize icon is actually drawn, unlike clicking it
+      // via clickAt.
+      await keyboard.pressKey(Key.LeftSuper, Key.Down);
+      await keyboard.releaseKey(Key.LeftSuper, Key.Down);
+      console.log(`[MINIMIZE] Minimized: ${focusedWindow.title}`);
+      session.sendRealtimeInput({
+        text: `(System note: the window was minimized. Let them know briefly.)`
+      });
+      notifyClient(clientWs, call, `Minimized`);
+    } catch (err: any) {
+      console.error(`[MINIMIZE] Failed:`, err);
+      session.sendRealtimeInput({
+        text: `(System note: minimizing was requested, but it failed to actually run — likely a setup issue on this machine, not something the user did wrong. Let them know honestly, briefly.)`
+      });
+      notifyClient(clientWs, call, `Minimize failed`);
+    }
+  }
+
+  async function handleCloseWindow(call: any, session: Session, clientWs: WebSocket) {
+    const focusedWindow = await focusTargetWindow();
+    console.log(`[CLOSE WINDOW] Focused window before closing: ${focusedWindow?.title ?? "(none found — no other window open)"}`);
+
+    if (!focusedWindow) {
+      session.sendRealtimeInput({
+        text: `(System note: closing was requested, but there's no other window open to close — only Aanya's own window is open. Let them know briefly.)`
+      });
+      notifyClient(clientWs, call, `Can't close — no other window is open`);
+      return;
+    }
+
+    try {
+      // Alt+F4 is the OS-level close shortcut -- same reliability reasoning
+      // as minimizeWindow above.
+      await keyboard.pressKey(Key.LeftAlt, Key.F4);
+      await keyboard.releaseKey(Key.LeftAlt, Key.F4);
+      console.log(`[CLOSE WINDOW] Closed: ${focusedWindow.title}`);
+      session.sendRealtimeInput({
+        text: `(System note: the window was closed. Let them know briefly.)`
+      });
+      notifyClient(clientWs, call, `Closed`);
+    } catch (err: any) {
+      console.error(`[CLOSE WINDOW] Failed:`, err);
+      session.sendRealtimeInput({
+        text: `(System note: closing was requested, but it failed to actually run — likely a setup issue on this machine, not something the user did wrong. Let them know honestly, briefly.)`
+      });
+      notifyClient(clientWs, call, `Close failed`);
+    }
+  }
+
   async function handleTypeText(call: any, session: Session, clientWs: WebSocket) {
     const text = String(call.args?.text ?? "");
 
@@ -1264,7 +1596,7 @@ wss.on("connection", async (clientWs, req) => {
 
     if (!focusedWindow) {
       session.sendRealtimeInput({
-        text: `(System note: typing was requested, but there's no other window open to type into — only Zoya's own window is open. Ask them to open the browser or app they want typed into, briefly.)`
+        text: `(System note: typing was requested, but there's no other window open to type into — only Aanya's own window is open. Ask them to open the browser or app they want typed into, briefly.)`
       });
       notifyClient(clientWs, call, `Can't type — no other window is open`);
       return;
@@ -1295,7 +1627,7 @@ wss.on("connection", async (clientWs, req) => {
 
     if (!focusedWindow) {
       session.sendRealtimeInput({
-        text: `(System note: scrolling was requested, but there's no other window open to scroll — only Zoya's own window is open. Ask them to open the browser or app they want scrolled, briefly.)`
+        text: `(System note: scrolling was requested, but there's no other window open to scroll — only Aanya's own window is open. Ask them to open the browser or app they want scrolled, briefly.)`
       });
       notifyClient(clientWs, call, `Can't scroll — no other window is open`);
       return;
@@ -1308,7 +1640,7 @@ wss.on("connection", async (clientWs, req) => {
       // OS focus. Focusing the window (above) was never enough by itself;
       // the cursor has to actually be moved into it first, or the scroll
       // silently lands wherever the cursor was last sitting (often still
-      // over Zoya's own window). The window's center is a safe point
+      // over Aanya's own window). The window's center is a safe point
       // that's always inside it regardless of size/position.
       const { left, top, width, height } = focusedWindow.region;
       const centerPoint = new Point(Math.round(left + width / 2), Math.round(top + height / 2));
@@ -1428,7 +1760,7 @@ wss.on("connection", async (clientWs, req) => {
           mediaResolution: MediaResolution.MEDIA_RESOLUTION_HIGH,
           // FIX (user's own voice never shows up as text anywhere): this
           // was missing entirely. outputAudioTranscription above only
-          // covers Zoya's own spoken replies being converted to text --
+          // covers Aanya's own spoken replies being converted to text --
           // it says nothing about the user's spoken input. Without this,
           // Gemini understands the user's speech (that's why it responds
           // correctly) but never converts it to text and sends it back,
@@ -1498,7 +1830,7 @@ wss.on("connection", async (clientWs, req) => {
                 }
               }
 
-              // Handle Output Audio Transcription (Zoya's spoken output converted to text)
+              // Handle Output Audio Transcription (Aanya's spoken output converted to text)
               const outputTranscriptionText = (message.serverContent as any)?.outputTranscription?.text;
               if (outputTranscriptionText) {
                 if (clientWs.readyState === WebSocket.OPEN) {
@@ -1517,7 +1849,7 @@ wss.on("connection", async (clientWs, req) => {
               // text by Gemini. Same handling pattern as output
               // transcription above, but tagged isUser:true so the client
               // (App.tsx's matchConfirmationVoiceCommand, and the chat
-              // transcript UI) can tell it apart from Zoya's own speech.
+              // transcript UI) can tell it apart from Aanya's own speech.
               // A distinct log prefix ([USER TRANSCRIPTION], not [GEMINI
               // TRANSCRIPTION]) makes this visually distinguishable in the
               // terminal too, since debugging this exact gap meant
@@ -1555,7 +1887,7 @@ wss.on("connection", async (clientWs, req) => {
                 const calls = message.toolCall.functionCalls;
                 if (calls && calls.length > 0) {
                   for (const call of calls) {
-                    console.log("Zoya tool call received:", call.name, call.args);
+                    console.log("Aanya tool call received:", call.name, call.args);
 
                     // FIX (TS2345 — string | undefined not assignable to string):
                     // @google/genai types call.name/call.id as optional. In
@@ -1564,7 +1896,7 @@ wss.on("connection", async (clientWs, req) => {
                     // the Map keys/lookups below (which all require a real
                     // string) if it's ever ever missing.
                     if (!call.name || !call.id) {
-                      console.warn("Zoya tool call arrived without a name or id — skipping:", call);
+                      console.warn("Aanya tool call arrived without a name or id — skipping:", call);
                       continue;
                     }
 
@@ -1607,7 +1939,7 @@ wss.on("connection", async (clientWs, req) => {
                           approvalsSoFar: 0
                         }));
                       }
-                    } else if (call.name === "openWebsite" || call.name === "openApplication" || call.name === "clickAt" || call.name === "typeText" || call.name === "scrollScreen") {
+                    } else if (call.name === "openWebsite" || call.name === "openApplication" || call.name === "clickAt" || call.name === "typeText" || call.name === "scrollScreen" || call.name === "minimizeWindow" || call.name === "closeWindow") {
                       // FIX (confirm popup narrowed to sensitive actions
                       // only): these five used to ALL require an on-screen
                       // confirm before running, every single time. The user
@@ -1650,6 +1982,10 @@ wss.on("connection", async (clientWs, req) => {
                         handleTypeText(call, session, clientWs);
                       } else if (call.name === "scrollScreen") {
                         handleScroll(call, session, clientWs);
+                      } else if (call.name === "minimizeWindow") {
+                        handleMinimizeWindow(call, session, clientWs);
+                      } else if (call.name === "closeWindow") {
+                        handleCloseWindow(call, session, clientWs);
                       }
                     } else if (call.name === "createFile") {
                       handleCreateFile(call, session, clientWs);
@@ -1814,7 +2150,7 @@ wss.on("connection", async (clientWs, req) => {
       if (clientWs.readyState === WebSocket.OPEN) {
         clientWs.send(JSON.stringify({
           type: "error",
-          error: "Zoya baar-baar disconnect ho rahi hai. Please refresh karke dobara try karein."
+          error: "Aanya baar-baar disconnect ho rahi hai. Please refresh karke dobara try karein."
         }));
       }
       reconnecting = false;
@@ -1830,9 +2166,75 @@ wss.on("connection", async (clientWs, req) => {
   await connectGeminiLive();
 
   // Handle messages from Client WebSocket
-  clientWs.on("message", (rawMessage) => {
+  clientWs.on("message", async (rawMessage) => {
     try {
       const dataObj = JSON.parse(rawMessage.toString());
+
+      if (dataObj.type === "workspaceFileRequest") {
+        const requestId = String(dataObj.requestId || "");
+        const filePath = String(dataObj.path || "");
+        const mode = dataObj.mode === "download" ? "download" : "view";
+        const respond = (payload: Record<string, unknown>) => {
+          if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.send(JSON.stringify({ type: "workspaceFileResult", requestId, ...payload }));
+          }
+        };
+
+        try {
+          if (!requestId || !filePath || !isWorkspaceFilePath(filePath)) {
+            respond({ error: "This file is not available in Aanya's workspace." });
+            return;
+          }
+          const stats = await fs.stat(filePath);
+          if (!stats.isFile()) {
+            respond({ error: "That workspace item is a folder, not a file." });
+            return;
+          }
+
+          const name = path.basename(filePath);
+          const mimeType = mimeForAttachment(name, "application/octet-stream");
+          const previewAvailable = isViewableWorkspaceFile(filePath) && stats.size <= 1024 * 1024;
+          if (mode === "view") {
+            if (!previewAvailable) {
+              respond({ file: { name, path: filePath, size: stats.size, mimeType, previewAvailable: false } });
+              return;
+            }
+            const content = await fs.readFile(filePath, "utf-8");
+            respond({ file: { name, path: filePath, size: stats.size, mimeType, previewAvailable: true, content } });
+            return;
+          }
+
+          // A download is an explicit user action. The original bytes are
+          // returned as base64 and saved by the browser; they are never run.
+          if (stats.size > MAX_ATTACHMENT_BYTES) {
+            respond({ error: "This file is too large to download from chat." });
+            return;
+          }
+          const data = await fs.readFile(filePath);
+          respond({ file: { name, path: filePath, size: stats.size, mimeType, previewAvailable, data: data.toString("base64") } });
+        } catch (error) {
+          console.error("[WORKSPACE FILE] Read failed:", error);
+          respond({ error: "Unable to open this file. It may have been moved or is no longer available." });
+        }
+        return;
+      }
+
+      if (dataObj.type === "attachment") {
+        const meta = dataObj.attachment;
+        const data = typeof dataObj.data === "string" ? dataObj.data : "";
+        const size = Number(meta?.size || 0);
+        const decodedSize = Math.floor((data.length * 3) / 4);
+        if (!meta?.id || !meta?.name || !data || size <= 0 || size > MAX_ATTACHMENT_BYTES || decodedSize > MAX_ATTACHMENT_BYTES) {
+          if (clientWs.readyState === WebSocket.OPEN) clientWs.send(JSON.stringify({ type: "attachmentStatus", attachment: { ...meta, status: "failed", error: "The attachment is missing or exceeds the 25 MB limit." } }));
+          return;
+        }
+        const attachment: UploadedAttachment = {
+          id: String(meta.id), name: path.basename(String(meta.name)), mimeType: mimeForAttachment(path.basename(String(meta.name)), String(meta.mimeType || "application/octet-stream")), size, data, receivedAt: Date.now(),
+        };
+        uploadedAttachments.set(attachment.id, attachment);
+        if (clientWs.readyState === WebSocket.OPEN) clientWs.send(JSON.stringify({ type: "attachmentStatus", attachment: { id: attachment.id, name: attachment.name, mimeType: attachment.mimeType, size: attachment.size, status: "ready" } }));
+        return;
+      }
 
       if (!liveSession || !sessionReady) {
         // Mid-reconnect — briefly drop this chunk instead of sending it into
@@ -1891,9 +2293,32 @@ wss.on("connection", async (clientWs, req) => {
           console.error(`[STAGE 5 GEMINI VISION IN] Failure: true | Error: ${err.message || err}`);
         }
       } else if (dataObj.type === "text" && dataObj.text) {
-        liveSession.sendRealtimeInput({
-          text: dataObj.text
-        });
+        const requestedIds = Array.isArray(dataObj.attachmentIds) ? dataObj.attachmentIds.map(String) : [];
+        const attachments = requestedIds.map((id: string) => uploadedAttachments.get(id)).filter(Boolean) as UploadedAttachment[];
+        const contexts = attachments.map(attachmentContext);
+
+        for (const attachment of attachments) {
+          const context = attachmentContext(attachment);
+          if (/^image\//.test(attachment.mimeType) || /\.(png|jpe?g|gif|webp)$/i.test(attachment.name)) {
+            liveSession.sendRealtimeInput({ video: { data: attachment.data, mimeType: attachment.mimeType === "application/octet-stream" ? "image/jpeg" : attachment.mimeType } });
+          }
+          if (context.specialist) {
+            if (clientWs.readyState === WebSocket.OPEN) clientWs.send(JSON.stringify({ type: "attachmentStatus", attachment: { id: attachment.id, name: attachment.name, mimeType: attachment.mimeType, size: attachment.size, status: "processing" } }));
+            void runSpecialistAgent(ai, context.specialist, `${context.text}\n\nUser instruction: ${dataObj.text}`, context.specialist === "video-analysis" || extensionOf(attachment.name) === "pdf" ? attachment : undefined)
+              .then((result) => {
+                if (clientWs.readyState === WebSocket.OPEN) clientWs.send(JSON.stringify({ type: "attachmentStatus", attachment: { id: attachment.id, name: attachment.name, mimeType: attachment.mimeType, size: attachment.size, status: "ready" } }));
+                liveSession?.sendRealtimeInput({ text: `(Verified specialist result for attachment ${attachment.name}: ${result}\nMain AI: review this report against the user's request, state limitations honestly, and give the user a concise final answer rather than blindly repeating it.)` });
+              })
+              .catch((error) => {
+                console.error("[ATTACHMENT AGENT] Failed:", error);
+                if (clientWs.readyState === WebSocket.OPEN) clientWs.send(JSON.stringify({ type: "attachmentStatus", attachment: { id: attachment.id, name: attachment.name, mimeType: attachment.mimeType, size: attachment.size, status: "failed", error: "Specialist processing failed." } }));
+                liveSession?.sendRealtimeInput({ text: `(System note: attachment analysis for ${attachment.name} failed before a verified result was available. Tell the user honestly.)` });
+              });
+          }
+        }
+
+        const attachmentNotes = contexts.map((context) => context.text).join("\n\n");
+        liveSession.sendRealtimeInput({ text: `${dataObj.text}\n\n${attachmentNotes}` });
       } else if (dataObj.type === "toolResponse") {
         console.log("Sending toolResponse back to Gemini Live:", dataObj.name, dataObj.id);
         liveSession.sendToolResponse({

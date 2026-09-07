@@ -43,7 +43,7 @@ export const ZoyaHeader: React.FC<ZoyaHeaderProps> = ({
         <div>
           <div className="flex items-center space-x-2">
             <h1 className="text-lg font-black tracking-wide bg-gradient-to-r from-pink-400 via-purple-300 to-cyan-400 bg-clip-text text-transparent">
-              ZOYA
+              AANYA
             </h1>
             <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest text-pink-300 bg-pink-950/60 border border-pink-500/40 rounded-full">
               LIVE AI
@@ -69,7 +69,7 @@ export const ZoyaHeader: React.FC<ZoyaHeaderProps> = ({
               ? 'bg-pink-500/20 border-pink-500/60 text-pink-300'
               : 'bg-slate-900/80 border-slate-800 text-slate-300 hover:border-slate-700 hover:text-white'
           }`}
-          title="Zoya Settings"
+          title="Aanya Settings"
         >
           <Settings className="w-5 h-5" />
         </button>
@@ -80,7 +80,7 @@ export const ZoyaHeader: React.FC<ZoyaHeaderProps> = ({
         <div className="absolute top-16 right-4 z-50 w-80 p-4 rounded-2xl bg-slate-900/95 border border-slate-700 shadow-2xl backdrop-blur-xl text-slate-200">
           <div className="flex items-center justify-between pb-3 border-b border-slate-800">
             <h3 className="font-bold text-sm text-pink-300 flex items-center">
-              <Settings className="w-4 h-4 mr-2" /> Zoya Preferences
+              <Settings className="w-4 h-4 mr-2" /> Aanya Preferences
             </h3>
             <button
               onClick={() => setShowSettings(false)}
