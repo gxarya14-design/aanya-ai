@@ -16,7 +16,7 @@ import { createServer as createViteServer } from "vite";
 // anywhere on the desktop, not just inside the Electron window. Native
 // bindings, so this only works in the environment it was `npm install`ed
 // in (see the delivery notes).
-import { mouse, keyboard, Point, Button, Key, getWindows, getActiveWindow, Region } from "@nut-tree-fork/nut-js";
+import { mouse, keyboard, Point, Button, Key, getWindows, getActiveWindow, Region, Window } from "@nut-tree-fork/nut-js";
 
 dotenv.config();
 
@@ -28,7 +28,7 @@ app.use(express.json());
 // Large media never travels through the live-chat WebSocket.  This is the
 // single configuration point for resumable, temporary video uploads.
 const VIDEO_UPLOAD_CONFIG = {
-  maxBytes: 500 * 1024 * 1024,
+  maxBytes: 2 * 1024 * 1024 * 1024,
   chunkBytes: 8 * 1024 * 1024,
   expiryMs: 6 * 60 * 60 * 1000,
   processingTimeoutMs: 10 * 60 * 1000,
@@ -81,7 +81,7 @@ app.post("/api/video-uploads", async (req, res) => {
   const size = Number(req.body?.size || 0);
   const totalChunks = Number(req.body?.totalChunks || 0);
   if (!filename || !Number.isSafeInteger(size) || size <= 0 || size > VIDEO_UPLOAD_CONFIG.maxBytes || !Number.isSafeInteger(totalChunks) || totalChunks < 1 || !isSupportedVideo(filename, mimeType)) {
-    res.status(400).json({ error: "Only MP4, MOV, and WebM videos up to 500 MB are supported for analysis." });
+    res.status(400).json({ error: "Only MP4, MOV, and WebM videos up to 2 GB are supported for analysis." });
     return;
   }
   const id = crypto.randomUUID();
@@ -504,6 +504,59 @@ async function focusTargetWindow(): Promise<{ title: string; region: Region } | 
   }
 }
 
+// FIX (voice "minimize karo" sometimes maximizing/restoring the window
+// instead): minimizeWindow used to reuse focusTargetWindow() above, which
+// calls win.focus() on the target before sending a Win+Down shortcut. But
+// .focus() on a window that is ALREADY minimized restores it first (that's
+// how bringing a minimized window to the foreground works on Windows) --
+// so a repeated "minimize karo" was silently un-minimizing the target
+// right before minimizing it again, and Win+Down itself is context-
+// sensitive (it restores a MAXIMIZED window to normal instead of
+// minimizing on the first press), so the net visible result was
+// inconsistent: sometimes the window flashed back to maximized/normal
+// instead of going to the taskbar. nut-js's Window class exposes a direct,
+// deterministic window.minimize() (confirmed in its own type
+// declarations) that acts on the window HANDLE, not the keyboard shortcut
+// -- it does not require the window to be focused/foreground first, so it
+// never triggers this restore side effect no matter what state the window
+// was already in. This finds the same target focusTargetWindow() would
+// (browser preferred, any other non-Aanya/non-shell window as fallback)
+// but returns the raw Window object and never calls .focus() on anything.
+async function findTargetWindowObject(): Promise<{ window: Window; title: string } | null> {
+  try {
+    const active = await getActiveWindow();
+    const activeTitle = await active.title;
+
+    if (isBrowserWindow(activeTitle)) {
+      return { window: active, title: activeTitle };
+    }
+
+    const allWindows = await getWindows();
+
+    for (const win of allWindows) {
+      const title = await win.title;
+      if (isBrowserWindow(title)) {
+        return { window: win, title };
+      }
+    }
+
+    if (isUsableTargetWindow(activeTitle)) {
+      return { window: active, title: activeTitle };
+    }
+    for (const win of allWindows) {
+      const title = await win.title;
+      if (isUsableTargetWindow(title)) {
+        return { window: win, title };
+      }
+    }
+
+    return null;
+  } catch (err) {
+    console.error("[WINDOW FIND] Failed to find a target window:", err);
+    return null;
+  }
+}
+
 async function handleCreateFile(call: any, session: Session, clientWs: WebSocket) {
   try {
     const filename = String(call.args?.filename || "untitled.txt");
@@ -701,6 +754,17 @@ async function handleOpenFile(call: any, session: Session, clientWs: WebSocket) 
 // `ai` is passed in explicitly (rather than making this a closure like
 // clickAt etc.) since it's created per-connection in the WebSocket
 // handler below, not at module level like the other handlers here.
+// FEATURE (honest quota/rate-limit reporting): a 429 RESOURCE_EXHAUSTED
+// from Gemini means the API quota/billing limit is hit -- it is not a code
+// bug, and telling the user "something went wrong" here would be
+// misleading. Distinguish it so Aanya can say the real thing.
+function describeAgentError(err: any): string {
+  if (err?.status === 429 || /RESOURCE_EXHAUSTED|quota/i.test(String(err?.message || ""))) {
+    return "the Gemini API quota/billing limit has been reached (HTTP 429) -- this is not a code bug. Tell the user honestly that the API's usage limit is exhausted for now and they should check their plan/billing at https://ai.google.dev/gemini-api/docs/rate-limits, or simply wait and try again shortly.";
+  }
+  return "something went wrong on the API side. Let the user know briefly, honestly.";
+}
+
 async function handleDelegateTask(call: any, session: Session, clientWs: WebSocket, ai: GoogleGenAI) {
   const taskName = String(call.args?.taskName || "task").trim();
   const taskDescription = String(call.args?.taskDescription || "").trim();
@@ -738,12 +802,22 @@ async function handleDelegateTask(call: any, session: Session, clientWs: WebSock
   // in flight at once.
   try {
     const specialist = selectSpecialist(taskDescription);
-    const resultText = await runSpecialistAgent(ai, specialist, taskDescription);
+    // FEATURE (real multi-pass orchestration): coding and video-analysis
+    // tasks now run through their dedicated multi-step pipelines
+    // (implementation -> review -> final correction; deep-research ->
+    // video-analysis) instead of a single specialist call. Aanya only
+    // ever sees the pipeline's final, already-verified output — the
+    // intermediate passes stay internal.
+    const resultText =
+      specialist === "coding" ? await runCodingPipeline(ai, taskDescription) :
+      specialist === "video-analysis" ? await runVideoOptimizationPipeline(ai, taskDescription) :
+      await runSpecialistAgent(ai, specialist, taskDescription);
     console.log(`[DELEGATE TASK] "${taskName}" finished:`, resultText.slice(0, 200));
 
     try {
-      session.sendRealtimeInput({
-        text: `(System note: the background agent for "${taskName}" just finished. Here's what it found: ${resultText}. Tell the user about this now, out loud, proactively — don't wait for them to ask. Summarize naturally in your own voice, in Hinglish, rather than reading this whole note verbatim.)`
+      session.sendClientContent({
+        turns: `(System note: the background agent for "${taskName}" just finished. Here's what it found: ${resultText}. Tell the user about this now, out loud, proactively — don't wait for them to ask. Summarize naturally in your own voice, in Hinglish, rather than reading this whole note verbatim.)`,
+        turnComplete: true
       });
     } catch (notifyErr) {
       // The live session may have already ended by the time a longer task
@@ -754,8 +828,9 @@ async function handleDelegateTask(call: any, session: Session, clientWs: WebSock
   } catch (err: any) {
     console.error(`[DELEGATE TASK] "${taskName}" failed:`, err);
     try {
-      session.sendRealtimeInput({
-        text: `(System note: the background agent for "${taskName}" failed to complete — something went wrong on the API side. Let the user know briefly, honestly.)`
+      session.sendClientContent({
+        turns: `(System note: the background agent for "${taskName}" failed to complete — ${describeAgentError(err)})`,
+        turnComplete: true
       });
     } catch (notifyErr) {
       console.warn(`[DELEGATE TASK] Could not deliver failure for "${taskName}" — session may have ended:`, notifyErr);
@@ -771,7 +846,16 @@ type UploadedAttachment = {
   name: string;
   mimeType: string;
   size: number;
-  data: string;
+  data?: string;
+  // Set once a large video (chunked upload) has been ingested by Gemini's
+  // Files API -- generateContent references it via a fileData part instead
+  // of inlineData, since base64 inline data does not scale to hundreds of
+  // MB / GB-sized video.
+  fileUri?: string;
+  // Set for a large video that has finished the chunked HTTP upload but has
+  // not yet been pushed to Gemini's Files API -- resolved lazily right
+  // before the specialist call, so nothing re-uploads it more than once.
+  pendingVideoUploadId?: string;
   receivedAt: number;
 };
 
@@ -813,7 +897,9 @@ function specialistInstruction(specialist: SpecialistName) {
 
 async function runSpecialistAgent(ai: GoogleGenAI, specialist: SpecialistName, task: string, attachment?: UploadedAttachment): Promise<string> {
   const parts: any[] = [{ text: `${specialistInstruction(specialist)}\n\nTask:\n${task}` }];
-  if (attachment) {
+  if (attachment?.fileUri) {
+    parts.push({ fileData: { fileUri: attachment.fileUri, mimeType: attachment.mimeType } });
+  } else if (attachment?.data) {
     parts.push({ inlineData: { mimeType: attachment.mimeType, data: attachment.data } });
   }
   const response = await ai.models.generateContent({
@@ -822,6 +908,94 @@ async function runSpecialistAgent(ai: GoogleGenAI, specialist: SpecialistName, t
     config: specialist === "live-research" || specialist === "deep-research" ? { tools: [{ googleSearch: {} }] } : undefined,
   });
   return response.text || "The specialist returned no usable result.";
+}
+
+// FEATURE (large video support, 500MB-1GB+): base64 inlineData does not
+// scale to hundreds of MB / GB of video -- Gemini's own Files API is the
+// correct mechanism. Uploads the already-received chunked-upload temp file
+// straight from disk (never loads it into Node's memory), then polls until
+// Gemini finishes ingesting/transcoding it before it can be referenced in a
+// generateContent call.
+async function uploadVideoToGemini(ai: GoogleGenAI, upload: StoredVideoUpload): Promise<{ fileUri: string; mimeType: string } | null> {
+  const uploaded = await ai.files.upload({ file: upload.tempPath, config: { mimeType: upload.mimeType, displayName: upload.filename } });
+  if (!uploaded.name) return null;
+
+  const deadline = Date.now() + VIDEO_UPLOAD_CONFIG.processingTimeoutMs;
+  let current = uploaded;
+  while (current.state === "PROCESSING") {
+    if (Date.now() > deadline) return null;
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    current = await ai.files.get({ name: uploaded.name });
+  }
+  if (current.state !== "ACTIVE" || !current.uri) return null;
+  return { fileUri: current.uri, mimeType: current.mimeType || upload.mimeType };
+}
+
+// FEATURE (real multi-pass coding verification, not just a single call
+// describing itself as having done three passes): the user wants the
+// Coding Agent's work actually checked and re-checked by fresh passes
+// before Aanya calls it final. Each pass below is its own separate
+// runSpecialistAgent call that only sees the previous pass(es)' output as
+// text context -- there is still no real execution sandbox, so PASS 2
+// is a genuine independent second look (which does catch real mistakes a
+// single pass misses), not actual running/testing. specialistInstruction's
+// HONESTY rules still apply at every pass, so none of them can claim
+// execution/tests that did not happen. Only PASS 3's output (the
+// corrected, final version) is ever returned -- pass 1 and pass 2 are
+// working drafts, never shown to the user directly.
+async function runCodingPipeline(ai: GoogleGenAI, taskDescription: string, attachment?: UploadedAttachment): Promise<string> {
+  console.log("[CODING PIPELINE] Pass 1/3 (implementation) starting");
+  const pass1 = await runSpecialistAgent(
+    ai,
+    "coding",
+    `${taskDescription}\n\n(This is PASS 1 of 3: IMPLEMENTATION. Write the actual code/change now, in full.)`,
+    attachment
+  );
+
+  console.log("[CODING PIPELINE] Pass 2/3 (independent review) starting");
+  const pass2 = await runSpecialistAgent(
+    ai,
+    "coding",
+    `You are now an INDEPENDENT REVIEWER checking a different engineer's work — do not assume it is correct.\n\nOriginal task:\n${taskDescription}\n\nTheir submitted implementation (PASS 1):\n${pass1}\n\n(This is PASS 2 of 3: INDEPENDENT REVIEW. Find real bugs, missed edge cases, or requirement mismatches. If it is genuinely correct and complete, say so plainly instead of inventing issues.)`,
+    attachment
+  );
+
+  console.log("[CODING PIPELINE] Pass 3/3 (final regression + correction) starting");
+  const pass3 = await runSpecialistAgent(
+    ai,
+    "coding",
+    `Original task:\n${taskDescription}\n\nPASS 1 implementation:\n${pass1}\n\nPASS 2 independent review findings:\n${pass2}\n\n(This is PASS 3 of 3: FINAL REGRESSION & CORRECTION. Apply every valid point from the review, then output the corrected, complete, FINAL version of the code — not a diff. Briefly list what pass 2 caught, if anything, then the full final code.)`,
+    attachment
+  );
+
+  return pass3;
+}
+
+// FEATURE (YouTube optimization pipeline — deep-research first, then video
+// analysis): the user sends a reference video and wants title/tags/
+// description/hashtags back, but grounded in what is actually working on
+// YouTube right now rather than the model's own guess from training data.
+// Two real, separate specialist calls chained together: Deep Research runs
+// FIRST (with live Google Search grounding — see runSpecialistAgent's
+// config), and its findings are handed to Video Analysis as context
+// alongside the actual reference video.
+async function runVideoOptimizationPipeline(ai: GoogleGenAI, taskDescription: string, attachment?: UploadedAttachment): Promise<string> {
+  console.log("[VIDEO PIPELINE] Stage 1/2 (deep research on current YouTube trends) starting");
+  const research = await runSpecialistAgent(
+    ai,
+    "deep-research",
+    `Research what is currently working on YouTube right now (as of today) — title phrasing patterns, tag strategy, description structure, and hashtag conventions — specifically relevant to this video/topic: ${taskDescription}`
+  );
+
+  console.log("[VIDEO PIPELINE] Stage 2/2 (video analysis grounded in research) starting");
+  const analysis = await runSpecialistAgent(
+    ai,
+    "video-analysis",
+    `${taskDescription}\n\nCurrent YouTube trend research to ground your suggestions in (from a separate Deep Research pass, not guessed):\n${research}\n\nAnalyze the attached reference video and produce, based on BOTH the actual video content above AND the trend research: (1) 3-5 optimized title options, (2) a tag list, (3) an optimized description, (4) a hashtag list.`,
+    attachment
+  );
+
+  return analysis;
 }
 
 // Reads only the ZIP central directory. It neither extracts nor executes the
@@ -846,11 +1020,11 @@ function inspectZipEntries(data: Buffer): string[] {
 function attachmentContext(attachment: UploadedAttachment): { text: string; specialist?: SpecialistName; inline: boolean } {
   const extension = extensionOf(attachment.name);
   if (TEXT_ATTACHMENT_EXTENSIONS.has(extension)) {
-    const content = Buffer.from(attachment.data, "base64").toString("utf8").slice(0, 60000);
+    const content = Buffer.from(attachment.data || "", "base64").toString("utf8").slice(0, 60000);
     return { inline: true, text: `Attached text file: ${attachment.name}\n\n${content}` };
   }
   if (extension === "zip") {
-    const entries = inspectZipEntries(Buffer.from(attachment.data, "base64"));
+    const entries = inspectZipEntries(Buffer.from(attachment.data || "", "base64"));
     return { inline: false, specialist: "coding", text: `Attached ZIP project: ${attachment.name}. Safely inspected archive listing (${entries.length} entries; no files extracted or executed):\n${entries.join("\n") || "No readable archive entries."}` };
   }
   if (/^image\//.test(attachment.mimeType) || /\.(png|jpe?g|gif|webp)$/i.test(attachment.name)) {
@@ -879,9 +1053,10 @@ async function handleOpenWebsite(call: any, session: Session, clientWs: WebSocke
   // actual wait for user approval in between anymore.
   if (!isSafeUrl(url)) {
     console.warn(`[OPEN WEBSITE] Rejected unsafe/invalid URL: "${url}"`);
-    session.sendRealtimeInput({
-      text: `(System note: opening a link was requested, but it turned out invalid, so nothing opened. Let them know briefly.)`
-    });
+    session.sendClientContent({
+        turns: `(System note: opening a link was requested, but it turned out invalid, so nothing opened. Let them know briefly.)`,
+        turnComplete: true
+      });
     notifyClient(clientWs, call, `Couldn't open that link`);
     return;
   }
@@ -903,15 +1078,17 @@ async function handleOpenWebsite(call: any, session: Session, clientWs: WebSocke
     const focusedWindow = await focusTargetWindow();
     console.log(`[OPEN WEBSITE] Focused window after opening: ${focusedWindow?.title ?? "(none found — no other window open)"}`);
 
-    session.sendRealtimeInput({
-      text: `(System note: ${siteName} is now open in their browser.)`
-    });
+    session.sendClientContent({
+        turns: `(System note: ${siteName} is now open in their browser.)`,
+        turnComplete: true
+      });
     notifyClient(clientWs, call, `Opened ${siteName}`);
   } catch (err: any) {
     console.error(`[OPEN WEBSITE] Failed:`, err);
-    session.sendRealtimeInput({
-      text: `(System note: opening ${siteName} failed. Let them know honestly.)`
-    });
+    session.sendClientContent({
+        turns: `(System note: opening ${siteName} failed. Let them know honestly.)`,
+        turnComplete: true
+      });
     notifyClient(clientWs, call, `Couldn't open ${siteName}`);
   }
 }
@@ -933,9 +1110,10 @@ async function handleOpenApplication(call: any, session: Session, clientWs: WebS
   // outcome rather than a second sendToolResponse to the same id.
   if (!isSafeAppName(appName)) {
     console.warn(`[OPEN APP] Rejected invalid app name: "${appName}"`);
-    session.sendRealtimeInput({
-      text: `(System note: opening an app was requested, but the name wasn't valid, so nothing was launched. Let them know briefly.)`
-    });
+    session.sendClientContent({
+        turns: `(System note: opening an app was requested, but the name wasn't valid, so nothing was launched. Let them know briefly.)`,
+        turnComplete: true
+      });
     notifyClient(clientWs, call, `Didn't recognize that app name`);
     return;
   }
@@ -947,8 +1125,9 @@ async function handleOpenApplication(call: any, session: Session, clientWs: WebS
     try {
       await execAsync(buildLaunchCmd(remembered));
       console.log(`[OPEN APP] Launched "${appName}" via remembered path: ${remembered}`);
-      session.sendRealtimeInput({
-        text: `(System note: ${appName} is now opening.)`
+      session.sendClientContent({
+        turns: `(System note: ${appName} is now opening.)`,
+        turnComplete: true
       });
       notifyClient(clientWs, call, `Opening ${appName}`);
       return;
@@ -963,17 +1142,19 @@ async function handleOpenApplication(call: any, session: Session, clientWs: WebS
   try {
     await execAsync(buildLaunchCmd(appName));
     console.log(`[OPEN APP] Launched by name: ${appName}`);
-    session.sendRealtimeInput({
-      text: `(System note: ${appName} is now opening.)`
-    });
+    session.sendClientContent({
+        turns: `(System note: ${appName} is now opening.)`,
+        turnComplete: true
+      });
     notifyClient(clientWs, call, `Opening ${appName}`);
   } catch (err: any) {
     // 3) Genuinely can't find it — this is the honest, common case for
     // software that isn't on PATH. Ask to be taught the exact path once.
     console.error(`[OPEN APP] Failed to launch '${appName}':`, err?.message || err);
-    session.sendRealtimeInput({
-      text: `(System note: "${appName}" could not be found by name — it isn't on PATH. Ask the user for the exact .exe file location (e.g. by right-clicking its shortcut → Properties → Target), then call rememberAppLocation with that exact path so it opens instantly every time after this.)`
-    });
+    session.sendClientContent({
+        turns: `(System note: "${appName}" could not be found by name — it isn't on PATH. Ask the user for the exact .exe file location (e.g. by right-clicking its shortcut → Properties → Target), then call rememberAppLocation with that exact path so it opens instantly every time after this.)`,
+        turnComplete: true
+      });
     notifyClient(clientWs, call, `Couldn't find "${appName}" — tell me its exact path`);
   }
 }
@@ -1471,8 +1652,9 @@ wss.on("connection", async (clientWs, req) => {
     const doubleClick = Boolean(call.args?.doubleClick);
 
     if (!Number.isFinite(scaledX) || !Number.isFinite(scaledY)) {
-      session.sendRealtimeInput({
-        text: `(System note: the click coordinates were invalid, so nothing was clicked. Let them know briefly.)`
+      session.sendClientContent({
+        turns: `(System note: the click coordinates were invalid, so nothing was clicked. Let them know briefly.)`,
+        turnComplete: true
       });
       notifyClient(clientWs, call, `Couldn't click — bad coordinates`);
       return;
@@ -1481,8 +1663,9 @@ wss.on("connection", async (clientWs, req) => {
     const real = scaleToRealCoordinates(scaledX, scaledY);
     if (!real) {
       console.warn(`[CLICK AT] No screen frame received yet — can't scale coordinates (${scaledX}, ${scaledY})`);
-      session.sendRealtimeInput({
-        text: `(System note: the click was requested, but the user's screen isn't being shared right now, so there's no way to know where on the real screen that is. Ask them to turn on screen sharing first, briefly.)`
+      session.sendClientContent({
+        turns: `(System note: the click was requested, but the user's screen isn't being shared right now, so there's no way to know where on the real screen that is. Ask them to turn on screen sharing first, briefly.)`,
+        turnComplete: true
       });
       notifyClient(clientWs, call, `Can't click — screen sharing is off`);
       return;
@@ -1492,8 +1675,9 @@ wss.on("connection", async (clientWs, req) => {
     console.log(`[CLICK AT] Focused window before click: ${focusedWindow?.title ?? "(none found — no other window open)"}`);
 
     if (!focusedWindow) {
-      session.sendRealtimeInput({
-        text: `(System note: the click was requested, but there's no other window open to click into — only Aanya's own window is open. Ask them to open the browser or app they want clicked, briefly.)`
+      session.sendClientContent({
+        turns: `(System note: the click was requested, but there's no other window open to click into — only Aanya's own window is open. Ask them to open the browser or app they want clicked, briefly.)`,
+        turnComplete: true
       });
       notifyClient(clientWs, call, `Can't click — no other window is open`);
       return;
@@ -1507,46 +1691,54 @@ wss.on("connection", async (clientWs, req) => {
         await mouse.leftClick();
       }
       console.log(`[CLICK AT] Clicked at real screen (${real.x}, ${real.y}) from scaled (${scaledX}, ${scaledY})`);
-      session.sendRealtimeInput({
-        text: `(System note: the click was performed. Let them know briefly.)`
+      session.sendClientContent({
+        turns: `(System note: the click was performed. Let them know briefly.)`,
+        turnComplete: true
       });
       notifyClient(clientWs, call, `Clicked`);
     } catch (err: any) {
       console.error(`[CLICK AT] Failed:`, err);
-      session.sendRealtimeInput({
-        text: `(System note: the click was requested, but it failed to actually run — likely a setup issue on this machine, not something the user did wrong. Let them know honestly, briefly.)`
+      session.sendClientContent({
+        turns: `(System note: the click was requested, but it failed to actually run — likely a setup issue on this machine, not something the user did wrong. Let them know honestly, briefly.)`,
+        turnComplete: true
       });
       notifyClient(clientWs, call, `Click failed`);
     }
   }
 
   async function handleMinimizeWindow(call: any, session: Session, clientWs: WebSocket) {
-    const focusedWindow = await focusTargetWindow();
-    console.log(`[MINIMIZE] Focused window before minimizing: ${focusedWindow?.title ?? "(none found — no other window open)"}`);
+    const target = await findTargetWindowObject();
+    console.log(`[MINIMIZE] Target window: ${target?.title ?? "(none found — no other window open)"}`);
 
-    if (!focusedWindow) {
-      session.sendRealtimeInput({
-        text: `(System note: minimizing was requested, but there's no other window open to minimize — only Aanya's own window is open. Let them know briefly.)`
+    if (!target) {
+      session.sendClientContent({
+        turns: `(System note: minimizing was requested, but there's no other window open to minimize — only Aanya's own window is open. Let them know briefly.)`,
+        turnComplete: true
       });
       notifyClient(clientWs, call, `Can't minimize — no other window is open`);
       return;
     }
 
     try {
-      // Win+Down is the OS-level minimize shortcut -- reliable regardless of
-      // where the tiny minimize icon is actually drawn, unlike clicking it
-      // via clickAt.
-      await keyboard.pressKey(Key.LeftSuper, Key.Down);
-      await keyboard.releaseKey(Key.LeftSuper, Key.Down);
-      console.log(`[MINIMIZE] Minimized: ${focusedWindow.title}`);
-      session.sendRealtimeInput({
-        text: `(System note: the window was minimized. Let them know briefly.)`
+      // FIX (voice "minimize karo" sometimes maximizing/restoring instead):
+      // window.minimize() acts directly on the window handle -- it does not
+      // require (or trigger) focusing the window first, so an
+      // already-minimized target is never accidentally restored as a
+      // side effect, and unlike the old Win+Down shortcut it is not
+      // context-sensitive (it always minimizes, never toggles to
+      // restore/maximize depending on the window's current state).
+      await target.window.minimize();
+      console.log(`[MINIMIZE] Minimized: ${target.title}`);
+      session.sendClientContent({
+        turns: `(System note: the window was minimized. Let them know briefly.)`,
+        turnComplete: true
       });
       notifyClient(clientWs, call, `Minimized`);
     } catch (err: any) {
       console.error(`[MINIMIZE] Failed:`, err);
-      session.sendRealtimeInput({
-        text: `(System note: minimizing was requested, but it failed to actually run — likely a setup issue on this machine, not something the user did wrong. Let them know honestly, briefly.)`
+      session.sendClientContent({
+        turns: `(System note: minimizing was requested, but it failed to actually run — likely a setup issue on this machine, not something the user did wrong. Let them know honestly, briefly.)`,
+        turnComplete: true
       });
       notifyClient(clientWs, call, `Minimize failed`);
     }
@@ -1557,8 +1749,9 @@ wss.on("connection", async (clientWs, req) => {
     console.log(`[CLOSE WINDOW] Focused window before closing: ${focusedWindow?.title ?? "(none found — no other window open)"}`);
 
     if (!focusedWindow) {
-      session.sendRealtimeInput({
-        text: `(System note: closing was requested, but there's no other window open to close — only Aanya's own window is open. Let them know briefly.)`
+      session.sendClientContent({
+        turns: `(System note: closing was requested, but there's no other window open to close — only Aanya's own window is open. Let them know briefly.)`,
+        turnComplete: true
       });
       notifyClient(clientWs, call, `Can't close — no other window is open`);
       return;
@@ -1570,14 +1763,16 @@ wss.on("connection", async (clientWs, req) => {
       await keyboard.pressKey(Key.LeftAlt, Key.F4);
       await keyboard.releaseKey(Key.LeftAlt, Key.F4);
       console.log(`[CLOSE WINDOW] Closed: ${focusedWindow.title}`);
-      session.sendRealtimeInput({
-        text: `(System note: the window was closed. Let them know briefly.)`
+      session.sendClientContent({
+        turns: `(System note: the window was closed. Let them know briefly.)`,
+        turnComplete: true
       });
       notifyClient(clientWs, call, `Closed`);
     } catch (err: any) {
       console.error(`[CLOSE WINDOW] Failed:`, err);
-      session.sendRealtimeInput({
-        text: `(System note: closing was requested, but it failed to actually run — likely a setup issue on this machine, not something the user did wrong. Let them know honestly, briefly.)`
+      session.sendClientContent({
+        turns: `(System note: closing was requested, but it failed to actually run — likely a setup issue on this machine, not something the user did wrong. Let them know honestly, briefly.)`,
+        turnComplete: true
       });
       notifyClient(clientWs, call, `Close failed`);
     }
@@ -1595,8 +1790,9 @@ wss.on("connection", async (clientWs, req) => {
     console.log(`[TYPE TEXT] Focused window before typing: ${focusedWindow?.title ?? "(none found — no other window open)"}`);
 
     if (!focusedWindow) {
-      session.sendRealtimeInput({
-        text: `(System note: typing was requested, but there's no other window open to type into — only Aanya's own window is open. Ask them to open the browser or app they want typed into, briefly.)`
+      session.sendClientContent({
+        turns: `(System note: typing was requested, but there's no other window open to type into — only Aanya's own window is open. Ask them to open the browser or app they want typed into, briefly.)`,
+        turnComplete: true
       });
       notifyClient(clientWs, call, `Can't type — no other window is open`);
       return;
@@ -1605,14 +1801,16 @@ wss.on("connection", async (clientWs, req) => {
     try {
       await keyboard.type(text);
       console.log(`[TYPE TEXT] Typed ${text.length} characters`);
-      session.sendRealtimeInput({
-        text: `(System note: the text was typed. Let them know briefly.)`
+      session.sendClientContent({
+        turns: `(System note: the text was typed. Let them know briefly.)`,
+        turnComplete: true
       });
       notifyClient(clientWs, call, `Typed it`);
     } catch (err: any) {
       console.error(`[TYPE TEXT] Failed:`, err);
-      session.sendRealtimeInput({
-        text: `(System note: typing was requested, but it failed to actually run — likely a setup issue on this machine, not something the user did wrong. Let them know honestly, briefly.)`
+      session.sendClientContent({
+        turns: `(System note: typing was requested, but it failed to actually run — likely a setup issue on this machine, not something the user did wrong. Let them know honestly, briefly.)`,
+        turnComplete: true
       });
       notifyClient(clientWs, call, `Typing failed`);
     }
@@ -1626,8 +1824,9 @@ wss.on("connection", async (clientWs, req) => {
     console.log(`[SCROLL] Focused window before scrolling: ${focusedWindow?.title ?? "(none found — no other window open)"}`);
 
     if (!focusedWindow) {
-      session.sendRealtimeInput({
-        text: `(System note: scrolling was requested, but there's no other window open to scroll — only Aanya's own window is open. Ask them to open the browser or app they want scrolled, briefly.)`
+      session.sendClientContent({
+        turns: `(System note: scrolling was requested, but there's no other window open to scroll — only Aanya's own window is open. Ask them to open the browser or app they want scrolled, briefly.)`,
+        turnComplete: true
       });
       notifyClient(clientWs, call, `Can't scroll — no other window is open`);
       return;
@@ -1657,14 +1856,16 @@ wss.on("connection", async (clientWs, req) => {
         await mouse.scrollDown(amount);
       }
       console.log(`[SCROLL] Scrolled ${direction} by ${amount}`);
-      session.sendRealtimeInput({
-        text: `(System note: the scroll was performed. Let them know briefly.)`
+      session.sendClientContent({
+        turns: `(System note: the scroll was performed. Let them know briefly.)`,
+        turnComplete: true
       });
       notifyClient(clientWs, call, `Scrolled ${direction}`);
     } catch (err: any) {
       console.error(`[SCROLL] Failed:`, err);
-      session.sendRealtimeInput({
-        text: `(System note: scrolling was requested, but it failed to actually run — likely a setup issue on this machine, not something the user did wrong. Let them know honestly, briefly.)`
+      session.sendClientContent({
+        turns: `(System note: scrolling was requested, but it failed to actually run — likely a setup issue on this machine, not something the user did wrong. Let them know honestly, briefly.)`,
+        turnComplete: true
       });
       notifyClient(clientWs, call, `Scroll failed`);
     }
@@ -2294,7 +2495,19 @@ wss.on("connection", async (clientWs, req) => {
         }
       } else if (dataObj.type === "text" && dataObj.text) {
         const requestedIds = Array.isArray(dataObj.attachmentIds) ? dataObj.attachmentIds.map(String) : [];
-        const attachments = requestedIds.map((id: string) => uploadedAttachments.get(id)).filter(Boolean) as UploadedAttachment[];
+        const attachments = requestedIds.map((id: string): UploadedAttachment | undefined => {
+          const small = uploadedAttachments.get(id);
+          if (small) return small;
+          // FEATURE (large video support): not a small in-memory attachment
+          // -- check the chunked video-upload sessions instead. Only
+          // fully-received uploads are usable; the Gemini Files API push
+          // itself happens lazily below, right before the specialist runs.
+          const videoUpload = videoUploads.get(id);
+          if (videoUpload && videoUpload.status === "uploaded") {
+            return { id: videoUpload.id, name: videoUpload.filename, mimeType: videoUpload.mimeType, size: videoUpload.size, pendingVideoUploadId: videoUpload.id, receivedAt: Date.now() };
+          }
+          return undefined;
+        }).filter(Boolean) as UploadedAttachment[];
         const contexts = attachments.map(attachmentContext);
 
         for (const attachment of attachments) {
@@ -2304,21 +2517,59 @@ wss.on("connection", async (clientWs, req) => {
           }
           if (context.specialist) {
             if (clientWs.readyState === WebSocket.OPEN) clientWs.send(JSON.stringify({ type: "attachmentStatus", attachment: { id: attachment.id, name: attachment.name, mimeType: attachment.mimeType, size: attachment.size, status: "processing" } }));
-            void runSpecialistAgent(ai, context.specialist, `${context.text}\n\nUser instruction: ${dataObj.text}`, context.specialist === "video-analysis" || extensionOf(attachment.name) === "pdf" ? attachment : undefined)
+            const attachmentTask = `${context.text}\n\nUser instruction: ${dataObj.text}`;
+            const pendingUploadId = attachment.pendingVideoUploadId;
+
+            // FEATURE (real multi-pass orchestration on uploaded attachments):
+            // a reference video sent as an attachment now goes through
+            // deep-research (current YouTube trends) before video-analysis
+            // looks at it; a coding-context upload (e.g. a zip project) now
+            // goes through the same 3-pass implementation/review/final chain
+            // as a voice-delegated coding task.
+            const runPipeline = async (): Promise<string> => {
+              let resolvedAttachment = attachment;
+              if (pendingUploadId) {
+                const videoUpload = videoUploads.get(pendingUploadId);
+                if (!videoUpload) throw new Error("Video upload session expired before it could be analyzed.");
+                videoUpload.status = "processing";
+                videoUpload.updatedAt = Date.now();
+                const geminiFile = await uploadVideoToGemini(ai, videoUpload);
+                if (!geminiFile) throw new Error("Gemini could not ingest the uploaded video in time.");
+                videoUpload.status = "analyzing";
+                videoUpload.updatedAt = Date.now();
+                resolvedAttachment = { ...attachment, fileUri: geminiFile.fileUri, mimeType: geminiFile.mimeType };
+              }
+              const rawAttachmentForModel = context.specialist === "video-analysis" || extensionOf(attachment.name) === "pdf" ? resolvedAttachment : undefined;
+              const result =
+                context.specialist === "video-analysis" ? await runVideoOptimizationPipeline(ai, attachmentTask, rawAttachmentForModel) :
+                context.specialist === "coding" ? await runCodingPipeline(ai, attachmentTask, rawAttachmentForModel) :
+                await runSpecialistAgent(ai, context.specialist!, attachmentTask, rawAttachmentForModel);
+              if (pendingUploadId) {
+                const videoUpload = videoUploads.get(pendingUploadId);
+                if (videoUpload) { videoUpload.status = "completed"; videoUpload.updatedAt = Date.now(); void removeVideoUpload(videoUpload); }
+              }
+              return result;
+            };
+
+            void runPipeline()
               .then((result) => {
                 if (clientWs.readyState === WebSocket.OPEN) clientWs.send(JSON.stringify({ type: "attachmentStatus", attachment: { id: attachment.id, name: attachment.name, mimeType: attachment.mimeType, size: attachment.size, status: "ready" } }));
-                liveSession?.sendRealtimeInput({ text: `(Verified specialist result for attachment ${attachment.name}: ${result}\nMain AI: review this report against the user's request, state limitations honestly, and give the user a concise final answer rather than blindly repeating it.)` });
+                liveSession?.sendClientContent({ turns: `(Verified specialist result for attachment ${attachment.name}: ${result}\nMain AI: review this report against the user's request, state limitations honestly, and give the user a concise final answer rather than blindly repeating it.)`, turnComplete: true });
               })
               .catch((error) => {
                 console.error("[ATTACHMENT AGENT] Failed:", error);
+                if (pendingUploadId) {
+                  const videoUpload = videoUploads.get(pendingUploadId);
+                  if (videoUpload) { videoUpload.status = "failed"; videoUpload.error = error?.message || "Video analysis failed."; videoUpload.updatedAt = Date.now(); }
+                }
                 if (clientWs.readyState === WebSocket.OPEN) clientWs.send(JSON.stringify({ type: "attachmentStatus", attachment: { id: attachment.id, name: attachment.name, mimeType: attachment.mimeType, size: attachment.size, status: "failed", error: "Specialist processing failed." } }));
-                liveSession?.sendRealtimeInput({ text: `(System note: attachment analysis for ${attachment.name} failed before a verified result was available. Tell the user honestly.)` });
+                liveSession?.sendClientContent({ turns: `(System note: attachment analysis for ${attachment.name} failed before a verified result was available — ${describeAgentError(error)})`, turnComplete: true });
               });
           }
         }
 
         const attachmentNotes = contexts.map((context) => context.text).join("\n\n");
-        liveSession.sendRealtimeInput({ text: `${dataObj.text}\n\n${attachmentNotes}` });
+        liveSession.sendClientContent({ turns: `${dataObj.text}\n\n${attachmentNotes}`, turnComplete: true });
       } else if (dataObj.type === "toolResponse") {
         console.log("Sending toolResponse back to Gemini Live:", dataObj.name, dataObj.id);
         liveSession.sendToolResponse({
@@ -2345,9 +2596,10 @@ wss.on("connection", async (clientWs, req) => {
         if (!dataObj.approved) {
           pendingConfirmations.delete(dataObj.id);
           console.log(`[TOOL CONFIRM] User denied:`, pending.name, pending.args);
-          liveSession.sendRealtimeInput({
-            text: `(System note: the user declined this action, so it was NOT performed. Acknowledge that naturally, briefly.)`
-          });
+          liveSession.sendClientContent({
+        turns: `(System note: the user declined this action, so it was NOT performed. Acknowledge that naturally, briefly.)`,
+        turnComplete: true
+      });
           notifyClient(clientWs, call, `Okay, skipped that`);
           return;
         }

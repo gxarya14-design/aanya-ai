@@ -45,4 +45,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
       return null;
     }
   },
+  uploadLargeVideo: async (filePath, name, mimeType, size) => {
+    try {
+      return await ipcRenderer.invoke('upload-large-video', { filePath, name, mimeType, size });
+    } catch (error) {
+      console.error('[Preload] Error uploading large video:', error);
+      return { error: String(error?.message || error) };
+    }
+  },
+  onVideoUploadProgress: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('video-upload-progress', listener);
+    return () => ipcRenderer.removeListener('video-upload-progress', listener);
+  },
 });

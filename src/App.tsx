@@ -1350,10 +1350,31 @@ function ChatInput({
       setAttachment({ id: crypto.randomUUID(), name: nativeSelection.name || "attachment", mimeType: nativeSelection.mimeType, size: nativeSelection.size || 0, status: "failed", error: nativeSelection.error });
       return;
     }
+    // FEATURE (large video uploads, 500MB-1GB+): a video too big for the
+    // small base64 path comes back as a filePath instead of inline data --
+    // stream it to the server in chunks instead, straight from disk.
+    if (nativeSelection?.isLargeVideo && nativeSelection.filePath) {
+      const uploadId = crypto.randomUUID();
+      const next: ChatAttachment = { id: uploadId, name: nativeSelection.name, mimeType: nativeSelection.mimeType, size: nativeSelection.size, status: "uploading", progress: 0 };
+      setAttachment(next);
+      const unsubscribe = window.electronAPI?.onVideoUploadProgress?.((payload) => {
+        setAttachment((current) => (current && current.id === uploadId ? { ...current, progress: payload.progress } : current));
+      });
+      const result = await window.electronAPI?.uploadLargeVideo?.(nativeSelection.filePath, nativeSelection.name, nativeSelection.mimeType, nativeSelection.size);
+      unsubscribe?.();
+      if (!result || result.error) {
+        setAttachment({ ...next, status: "failed", error: result?.error || "Video upload failed." });
+        return;
+      }
+      // The chunked-upload session id IS the attachment id from here on --
+      // the server resolves it the same way it resolves a small attachment.
+      setAttachment({ id: result.id, name: result.name, mimeType: result.mimeType, size: result.size, status: "ready" });
+      return;
+    }
     if (nativeSelection) {
       const next: ChatAttachment = { id: crypto.randomUUID(), name: nativeSelection.name, mimeType: nativeSelection.mimeType, size: nativeSelection.size, status: "ready" };
       setAttachment(next);
-      onUpload(next, nativeSelection.data);
+      if (nativeSelection.data) onUpload(next, nativeSelection.data);
       return;
     }
     if (!window.electronAPI) fileInputRef.current?.click();
@@ -1415,7 +1436,7 @@ function ChatInput({
         </button>
       </div>
 
-      {attachment && <div className={`zoya-attachment ${attachment.status}`}><FileText size={13} /><span>{attachment.name}</span><small>{attachment.status === "uploading" ? "Uploading" : attachment.status === "ready" ? "Ready" : attachment.error || "Failed"}</small><button type="button" onClick={() => setAttachment(null)} aria-label="Remove attachment"><X size={13} /></button></div>}
+      {attachment && <div className={`zoya-attachment ${attachment.status}`}><FileText size={13} /><span>{attachment.name}</span><small>{attachment.status === "uploading" ? (typeof attachment.progress === "number" ? `Uploading ${attachment.progress}%` : "Uploading") : attachment.status === "ready" ? "Ready" : attachment.error || "Failed"}</small><button type="button" onClick={() => setAttachment(null)} aria-label="Remove attachment"><X size={13} /></button></div>}
 
       <div className="zoya-chat-hint">
         Press Enter to send

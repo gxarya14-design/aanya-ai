@@ -51,6 +51,7 @@ export interface ChatAttachment {
   size: number;
   status: 'uploading' | 'ready' | 'processing' | 'failed';
   error?: string;
+  progress?: number;
 }
 
 export interface ZoyaConfig {

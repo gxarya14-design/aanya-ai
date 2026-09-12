@@ -29,7 +29,6 @@ export class LiveSession {
   private isModelResponding: boolean = false;
   private micPacketCount: number = 0;
   private geminiAudioPacketCount: number = 0;
-  private speechRecognizer: any = null;
   private workspaceFileRequests = new Map<string, {
     resolve: (result: WorkspaceFileReadResult) => void;
     reject: (error: Error) => void;
@@ -38,7 +37,6 @@ export class LiveSession {
   constructor(callbacks: LiveSessionCallbacks, voice: ZoyaVoice = 'Kore') {
     this.callbacks = callbacks;
     this.voice = voice;
-    this.initSpeechRecognition();
 
     this.player = new AudioPlayer(
       (isPlaying) => {
@@ -86,41 +84,6 @@ export class LiveSession {
     );
 
     this.screenSharer = new ScreenSharer();
-  }
-
-  private initSpeechRecognition(): void {
-    if (typeof window === 'undefined') return;
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (SpeechRecognition) {
-      try {
-        this.speechRecognizer = new SpeechRecognition();
-        this.speechRecognizer.continuous = true;
-        this.speechRecognizer.interimResults = false;
-
-        this.speechRecognizer.onresult = (event: any) => {
-          const lastIndex = event.results.length - 1;
-          const transcript = event.results[lastIndex]?.[0]?.transcript;
-          if (transcript && transcript.trim()) {
-            console.log(`[USER TEXT RECEIVED] Speech Recognition Transcript: "${transcript.trim()}"`);
-            this.callbacks.onTextReceived(transcript.trim(), true);
-          }
-        };
-
-        this.speechRecognizer.onerror = (err: any) => {
-          console.log('[LiveSession] Speech recognition notice (non-fatal):', err.error);
-        };
-
-        this.speechRecognizer.onend = () => {
-          if (this.ws && this.ws.readyState === WebSocket.OPEN && !this.isMuted) {
-            try {
-              this.speechRecognizer?.start();
-            } catch (_) {}
-          }
-        };
-      } catch (e) {
-        console.warn('SpeechRecognition initialization notice:', e);
-      }
-    }
   }
 
   public getState(): SessionState {
@@ -235,8 +198,7 @@ export class LiveSession {
         // Start microphone recording
         try {
           await this.recorder?.start();
-          try { this.speechRecognizer?.start(); } catch (_) {}
-          console.log("[LiveSession Debug] AudioRecorder & SpeechRecognizer started mic capture");
+          console.log("[LiveSession Debug] AudioRecorder started mic capture");
         } catch (e: any) {
           this.callbacks.onError("Microphone permission denied or unavailable.");
         }
@@ -410,7 +372,6 @@ export class LiveSession {
 
       this.ws.onclose = () => {
         console.log("[LiveSession Debug] Client WebSocket closed");
-        try { this.speechRecognizer?.stop(); } catch (_) {}
         this.recorder?.stop();
         this.player?.stopAll();
         this.screenSharer?.stop();

@@ -165,9 +165,32 @@ ipcMain.handle('select-chat-attachment', async (event) => {
     const filePath = result.filePaths[0];
     if (result.canceled || !filePath) return null;
     const stats = await fs.stat(filePath);
+    if (!stats.isFile()) return { error: 'Please select a file.' };
+
+    // FEATURE (large video uploads, 500MB-1GB+): reading the whole file
+    // into memory and base64-encoding it for the small-attachment path
+    // (below) does not scale past a few tens of MB. A video, up to the
+    // server's chunked-upload cap, is instead handed back as a bare
+    // filePath -- the renderer calls uploadLargeVideo, which streams it to
+    // the server in 8MB chunks straight from disk, never holding the whole
+    // file in memory at once.
+    const extension = path.extname(filePath).slice(1).toLowerCase();
+    const maxVideoBytes = 2 * 1024 * 1024 * 1024;
+    const videoMimeByExtension = { mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm' };
+    if (videoMimeByExtension[extension]) {
+      if (stats.size > maxVideoBytes) return { error: 'Videos must be 2 GB or smaller.' };
+      return {
+        name: path.basename(filePath),
+        size: stats.size,
+        mimeType: videoMimeByExtension[extension],
+        filePath,
+        isLargeVideo: true,
+      };
+    }
+
     const maxBytes = 25 * 1024 * 1024;
-    if (!stats.isFile() || stats.size > maxBytes) {
-      return { error: stats.isFile() ? 'Files must be 25 MB or smaller.' : 'Please select a file.' };
+    if (stats.size > maxBytes) {
+      return { error: 'Files must be 25 MB or smaller.' };
     }
     const data = await fs.readFile(filePath);
     return {
@@ -186,6 +209,63 @@ ipcMain.handle('select-chat-attachment', async (event) => {
 
 app.whenReady().then(() => {
   createWindow();
+});
+
+// FEATURE (large video uploads, 500MB-1GB+): does the entire chunked-upload
+// loop here in the main process, reading fixed-size slices straight from
+// disk via a file handle. Nothing about the video ever crosses the
+// Electron IPC boundary as base64 -- only small JSON status/progress
+// messages do. Server-side endpoints already existed
+// (/api/video-uploads/...); this is the first real caller of them.
+const VIDEO_CHUNK_BYTES = 8 * 1024 * 1024;
+const SERVER_BASE_URL = 'http://localhost:3000';
+
+ipcMain.handle('upload-large-video', async (event, { filePath, name, mimeType, size }) => {
+  let fileHandle;
+  try {
+    const totalChunks = Math.ceil(size / VIDEO_CHUNK_BYTES);
+    const createRes = await fetch(`${SERVER_BASE_URL}/api/video-uploads`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: name, mimeType, size, totalChunks }),
+    });
+    if (!createRes.ok) {
+      const body = await createRes.json().catch(() => ({}));
+      throw new Error(body.error || `Could not start the upload (HTTP ${createRes.status}).`);
+    }
+    const { id } = await createRes.json();
+
+    fileHandle = await fs.open(filePath, 'r');
+    const buffer = Buffer.alloc(VIDEO_CHUNK_BYTES);
+    for (let index = 0; index < totalChunks; index++) {
+      const position = index * VIDEO_CHUNK_BYTES;
+      const { bytesRead } = await fileHandle.read(buffer, 0, VIDEO_CHUNK_BYTES, position);
+      const chunk = buffer.subarray(0, bytesRead);
+      const chunkRes = await fetch(`${SERVER_BASE_URL}/api/video-uploads/${id}/chunks/${index}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': String(chunk.length) },
+        body: chunk,
+        duplex: 'half',
+      });
+      if (!chunkRes.ok) {
+        const body = await chunkRes.json().catch(() => ({}));
+        throw new Error(body.error || `Chunk ${index + 1}/${totalChunks} failed to upload.`);
+      }
+      event.sender.send('video-upload-progress', { id, progress: Math.round(((index + 1) / totalChunks) * 100) });
+    }
+
+    const completeRes = await fetch(`${SERVER_BASE_URL}/api/video-uploads/${id}/complete`, { method: 'POST' });
+    if (!completeRes.ok) {
+      const body = await completeRes.json().catch(() => ({}));
+      throw new Error(body.error || 'Could not finalize the upload.');
+    }
+    return { id, name, mimeType, size };
+  } catch (error) {
+    console.error('[ElectronMain] uploadLargeVideo failed:', error);
+    return { error: error?.message || 'Video upload failed.' };
+  } finally {
+    await fileHandle?.close().catch(() => undefined);
+  }
 });
 
 app.on('window-all-closed', () => {

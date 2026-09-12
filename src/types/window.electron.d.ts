@@ -16,7 +16,13 @@ declare global {
       // FEATURE (open existing files on the PC by voice): mirrors
       // openExternalUrl, but for local files via shell.openPath.
       openFilePath: (path: string) => Promise<{ ok: boolean; error?: string }>;
-      selectChatAttachment: () => Promise<{ name: string; size: number; mimeType: string; data: string; error?: string } | null>;
+      selectChatAttachment: () => Promise<{ name: string; size: number; mimeType: string; data?: string; filePath?: string; isLargeVideo?: boolean; error?: string } | null>;
+      // FEATURE (large video uploads, 500MB-1GB+): streams the file to the
+      // server's chunked-upload endpoints straight from disk in the main
+      // process; the returned id doubles as an attachmentId for
+      // sendTextMessage, exactly like a small attachment's id.
+      uploadLargeVideo: (filePath: string, name: string, mimeType: string, size: number) => Promise<{ id: string; name: string; mimeType: string; size: number; error?: string }>;
+      onVideoUploadProgress: (callback: (payload: { id: string; progress: number }) => void) => () => void;
     };
   }
 }
