@@ -10,6 +10,7 @@ import { promisify } from "util";
 import dotenv from "dotenv";
 import { WebSocketServer, WebSocket } from "ws";
 import { GoogleGenAI, LiveServerMessage, Modality, Type, Session, MediaResolution } from "@google/genai";
+import Anthropic from "@anthropic-ai/sdk";
 import { createServer as createViteServer } from "vite";
 // FIX (PC-wide click/scroll control): nut.js drives the real OS mouse
 // cursor and keyboard — this is what lets Aanya actually click/type/scroll
@@ -36,6 +37,29 @@ const VIDEO_UPLOAD_CONFIG = {
   supportedExtensions: new Set(["mp4", "mov", "webm"]),
 };
 const VIDEO_UPLOAD_DIR = path.join(os.tmpdir(), "zoya-video-uploads");
+
+// FEATURE (multi-provider specialists — spreads API quota risk across
+// separate providers/keys instead of every specialist sharing the one
+// Gemini key the live conversation itself depends on):
+//   - Coding specialist -> Anthropic Claude (no Google Search grounding or
+//     native video understanding needed for it, and independently rated as
+//     the strongest coding model).
+//   - Deep-research / live-research / video-analysis -> stay on Gemini,
+//     since Google Search grounding and native video/audio understanding
+//     are Gemini-only features this app depends on.
+//   - Background/specialist Gemini calls use GEMINI_API_KEY_AGENTS (falls
+//     back to GEMINI_API_KEY if not set) so a quota-hungry pipeline can
+//     never take down the live voice conversation itself, which always
+//     uses GEMINI_API_KEY directly.
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
+const anthropic = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
+const CLAUDE_CODING_MODEL = "claude-sonnet-5"; // swap to "claude-opus-5" for max coding quality at higher cost
+
+// FEATURE (real YouTube trend grounding): a separate, free, independent
+// quota (10,000 units/day) from the YouTube Data API v3 -- used to ground
+// title/tag/description suggestions in what is ACTUALLY ranking on YouTube
+// right now, not just what a model infers from general web search.
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || "";
 
 type StoredVideoUpload = {
   id: string;
@@ -759,7 +783,7 @@ async function handleOpenFile(call: any, session: Session, clientWs: WebSocket) 
 // bug, and telling the user "something went wrong" here would be
 // misleading. Distinguish it so Aanya can say the real thing.
 function describeAgentError(err: any): string {
-  if (err?.status === 429 || /RESOURCE_EXHAUSTED|quota/i.test(String(err?.message || ""))) {
+  if (err?.status === 429 || /RESOURCE_EXHAUSTED|quota|rate_limit/i.test(String(err?.message || ""))) {
     return "the Gemini API quota/billing limit has been reached (HTTP 429) -- this is not a code bug. Tell the user honestly that the API's usage limit is exhausted for now and they should check their plan/billing at https://ai.google.dev/gemini-api/docs/rate-limits, or simply wait and try again shortly.";
   }
   return "something went wrong on the API side. Let the user know briefly, honestly.";
@@ -809,7 +833,7 @@ async function handleDelegateTask(call: any, session: Session, clientWs: WebSock
     // ever sees the pipeline's final, already-verified output — the
     // intermediate passes stay internal.
     const resultText =
-      specialist === "coding" ? await runCodingPipeline(ai, taskDescription) :
+      specialist === "coding" ? await runCodingPipeline(taskDescription) :
       specialist === "video-analysis" ? await runVideoOptimizationPipeline(ai, taskDescription) :
       await runSpecialistAgent(ai, specialist, taskDescription);
     console.log(`[DELEGATE TASK] "${taskName}" finished:`, resultText.slice(0, 200));
@@ -891,8 +915,40 @@ function specialistInstruction(specialist: SpecialistName) {
   const shared = `Return a concise structured result with these exact headings: task_status, summary, findings, files_changed, tests_performed, test_results, errors, corrections, limitations, recommendations. Never claim access, execution, testing, or analysis that did not occur.`;
   if (specialist === "coding") return `${shared}\nYou are the Coding Agent. Inspect only the supplied project context. Propose the smallest safe change. If runnable project files are not available, explicitly say validation could not be run; do not invent it. Use a three-pass validation plan: implementation, independent review, final regression review.`;
   if (specialist === "live-research") return `${shared}\nYou are the Live Research & Execution Agent. Use Google Search grounding for current facts, compare reliable sources, and label uncertainty. Report only actual execution results.`;
-  if (specialist === "video-analysis") return `${shared}\nYou are the Video Analysis & Content Agent. Analyze the actual supplied video/audio/visual content only. Identify scenes, pacing, on-screen text and spoken content when observable, then offer grounded YouTube and social recommendations. Never invent scenes or dialogue.`;
+  if (specialist === "video-analysis") return `${shared}\nYou are the Video Analysis & Content Agent. Analyze the actual supplied video's scenes, pacing, on-screen text, spoken audio, and visuals together. If the video has no audio track and no on-screen text, say so explicitly and base your analysis on visuals only -- never invent dialogue, narration, or on-screen text that isn't there. Ground title/tag/description suggestions in the real trending data and research provided to you, not guesses.`;
   return `${shared}\nYou are the Deep Research Agent. Break down the question, use reliable sources, distinguish evidence from inference, and synthesize conflicts and uncertainties.`;
+}
+
+// FEATURE (proactive screen-watching): a single lightweight, tool-free
+// Gemini call against the latest screen frame -- deliberately NOT a
+// pipeline or multi-pass check, since this runs repeatedly in the
+// background and needs to stay cheap. Returns null when there is nothing
+// worth proactively saying (the model is explicitly told to answer with
+// exactly "NONE" in that case), so silence is the default and Aanya only
+// speaks up when something genuinely warrants it. Uses agentsAi (the
+// separate background-quota client), never the live conversation's own key.
+async function checkProactiveScreenComment(agentsAi: GoogleGenAI, frame: { data: string; mimeType: string }): Promise<string | null> {
+  try {
+    const response = await agentsAi.models.generateContent({
+      model: "gemini-3.7-flash",
+      contents: {
+        parts: [
+          { inlineData: { mimeType: frame.mimeType, data: frame.data } },
+          {
+            text: "You are an AI assistant watching this user's screen live, unprompted, while they work. Look at ONLY what is actually visible in this frame. Decide if there is something genuinely worth proactively telling them right now -- for example they appear stuck, made a visible mistake, are about to delete/overwrite something important, hit a visible error, or are doing something where a short tip would clearly help. Most of the time there will be nothing worth saying. If nothing meets that bar, respond with EXACTLY the single word: NONE. Otherwise respond with ONE short, natural sentence to say to them -- no preamble, no headings, just the sentence. Never invent or guess at anything not actually visible in the frame."
+          }
+        ]
+      }
+    });
+    const text = (response.text || "").trim();
+    if (!text || /^none\.?$/i.test(text)) return null;
+    return text;
+  } catch (err: any) {
+    // Fails silently -- a failed background watch check should never
+    // interrupt or error out the live conversation.
+    console.error("[PROACTIVE WATCH] Check failed:", err?.message || err);
+    return null;
+  }
 }
 
 async function runSpecialistAgent(ai: GoogleGenAI, specialist: SpecialistName, task: string, attachment?: UploadedAttachment): Promise<string> {
@@ -931,67 +987,141 @@ async function uploadVideoToGemini(ai: GoogleGenAI, upload: StoredVideoUpload): 
   return { fileUri: current.uri, mimeType: current.mimeType || upload.mimeType };
 }
 
+// FEATURE (multi-provider): coding specialist calls now go to Anthropic
+// Claude instead of Gemini -- independently rated the strongest coding
+// model, and it puts coding load on a completely separate provider/quota
+// from the Gemini key the live conversation and other specialists share.
+// No Google Search grounding or native video understanding is needed for
+// coding, so nothing is lost by moving it off Gemini.
+async function callClaudeCodingSpecialist(userPrompt: string): Promise<string> {
+  if (!anthropic) {
+    return "task_status: FAILED\nsummary: The coding specialist is not configured.\nerrors: ANTHROPIC_API_KEY is missing.\nlimitations: Cannot run the coding pipeline without an Anthropic API key in .env.";
+  }
+  const response = await anthropic.messages.create({
+    model: CLAUDE_CODING_MODEL,
+    max_tokens: 8192,
+    system: specialistInstruction("coding"),
+    messages: [{ role: "user", content: userPrompt }],
+  });
+  const textBlocks = response.content
+    .filter((block): block is Anthropic.TextBlock => block.type === "text")
+    .map((block) => block.text);
+  return textBlocks.join("\n") || "The coding specialist returned no usable result.";
+}
+
 // FEATURE (real multi-pass coding verification, not just a single call
 // describing itself as having done three passes): the user wants the
 // Coding Agent's work actually checked and re-checked by fresh passes
-// before Aanya calls it final. Each pass below is its own separate
-// runSpecialistAgent call that only sees the previous pass(es)' output as
-// text context -- there is still no real execution sandbox, so PASS 2
-// is a genuine independent second look (which does catch real mistakes a
-// single pass misses), not actual running/testing. specialistInstruction's
-// HONESTY rules still apply at every pass, so none of them can claim
-// execution/tests that did not happen. Only PASS 3's output (the
-// corrected, final version) is ever returned -- pass 1 and pass 2 are
-// working drafts, never shown to the user directly.
-async function runCodingPipeline(ai: GoogleGenAI, taskDescription: string, attachment?: UploadedAttachment): Promise<string> {
+// before Aanya calls it final. Each pass below is its own separate Claude
+// call that only sees the previous pass(es)' output as text context --
+// there is still no real execution sandbox, so PASS 2 is a genuine
+// independent second look (which does catch real mistakes a single pass
+// misses), not actual running/testing. specialistInstruction's HONESTY
+// rules still apply at every pass, so none of them can claim execution/
+// tests that did not happen. Only PASS 3's output (the corrected, final
+// version) is ever returned -- pass 1 and pass 2 are working drafts, never
+// shown to the user directly.
+async function runCodingPipeline(taskDescription: string): Promise<string> {
   console.log("[CODING PIPELINE] Pass 1/3 (implementation) starting");
-  const pass1 = await runSpecialistAgent(
-    ai,
-    "coding",
-    `${taskDescription}\n\n(This is PASS 1 of 3: IMPLEMENTATION. Write the actual code/change now, in full.)`,
-    attachment
+  const pass1 = await callClaudeCodingSpecialist(
+    `${taskDescription}\n\n(This is PASS 1 of 3: IMPLEMENTATION. Write the actual code/change now, in full.)`
   );
 
   console.log("[CODING PIPELINE] Pass 2/3 (independent review) starting");
-  const pass2 = await runSpecialistAgent(
-    ai,
-    "coding",
-    `You are now an INDEPENDENT REVIEWER checking a different engineer's work — do not assume it is correct.\n\nOriginal task:\n${taskDescription}\n\nTheir submitted implementation (PASS 1):\n${pass1}\n\n(This is PASS 2 of 3: INDEPENDENT REVIEW. Find real bugs, missed edge cases, or requirement mismatches. If it is genuinely correct and complete, say so plainly instead of inventing issues.)`,
-    attachment
+  const pass2 = await callClaudeCodingSpecialist(
+    `You are now an INDEPENDENT REVIEWER checking a different engineer's work — do not assume it is correct.\n\nOriginal task:\n${taskDescription}\n\nTheir submitted implementation (PASS 1):\n${pass1}\n\n(This is PASS 2 of 3: INDEPENDENT REVIEW. Find real bugs, missed edge cases, or requirement mismatches. If it is genuinely correct and complete, say so plainly instead of inventing issues.)`
   );
 
   console.log("[CODING PIPELINE] Pass 3/3 (final regression + correction) starting");
-  const pass3 = await runSpecialistAgent(
-    ai,
-    "coding",
-    `Original task:\n${taskDescription}\n\nPASS 1 implementation:\n${pass1}\n\nPASS 2 independent review findings:\n${pass2}\n\n(This is PASS 3 of 3: FINAL REGRESSION & CORRECTION. Apply every valid point from the review, then output the corrected, complete, FINAL version of the code — not a diff. Briefly list what pass 2 caught, if anything, then the full final code.)`,
-    attachment
+  const pass3 = await callClaudeCodingSpecialist(
+    `Original task:\n${taskDescription}\n\nPASS 1 implementation:\n${pass1}\n\nPASS 2 independent review findings:\n${pass2}\n\n(This is PASS 3 of 3: FINAL REGRESSION & CORRECTION. Apply every valid point from the review, then output the corrected, complete, FINAL version of the code — not a diff. Briefly list what pass 2 caught, if anything, then the full final code.)`
   );
 
   return pass3;
 }
 
-// FEATURE (YouTube optimization pipeline — deep-research first, then video
-// analysis): the user sends a reference video and wants title/tags/
-// description/hashtags back, but grounded in what is actually working on
-// YouTube right now rather than the model's own guess from training data.
-// Two real, separate specialist calls chained together: Deep Research runs
-// FIRST (with live Google Search grounding — see runSpecialistAgent's
-// config), and its findings are handed to Video Analysis as context
-// alongside the actual reference video.
-async function runVideoOptimizationPipeline(ai: GoogleGenAI, taskDescription: string, attachment?: UploadedAttachment): Promise<string> {
-  console.log("[VIDEO PIPELINE] Stage 1/2 (deep research on current YouTube trends) starting");
-  const research = await runSpecialistAgent(
-    ai,
+// FEATURE (live YouTube trend grounding): calls the real YouTube Data API
+// v3 (free, 10,000 units/day, entirely separate from the Gemini quota) so
+// the video pipeline can cite ACTUAL currently-trending videos on a topic
+// -- not just what a model infers from general web search. search.list
+// costs 100 units/call (~100 searches/day headroom); videos.list costs 1
+// unit/video for the stats. Fails soft (empty array) if no key is set or
+// the request errors, so the pipeline still works without it, just less
+// grounded.
+async function searchYouTubeTrending(topic: string, maxResults = 6): Promise<Array<{ title: string; channelTitle: string; publishedAt: string; viewCount?: string; tags?: string[]; url: string }>> {
+  if (!YOUTUBE_API_KEY) {
+    console.log("[YOUTUBE TRENDING] Skipped — YOUTUBE_API_KEY not configured.");
+    return [];
+  }
+  try {
+    const publishedAfter = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+    const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&order=viewCount&maxResults=${maxResults}&publishedAfter=${encodeURIComponent(publishedAfter)}&q=${encodeURIComponent(topic.slice(0, 200))}&key=${YOUTUBE_API_KEY}`;
+    const searchRes = await fetch(searchUrl);
+    if (!searchRes.ok) {
+      console.error(`[YOUTUBE TRENDING] search.list failed: ${searchRes.status} ${await searchRes.text()}`);
+      return [];
+    }
+    const searchData: any = await searchRes.json();
+    const videoIds: string[] = (searchData.items || []).map((item: any) => item.id?.videoId).filter(Boolean);
+    if (videoIds.length === 0) return [];
+
+    const detailsUrl = `https://www.googleapis.com/youtube/v3/videos?part=snippet,statistics&id=${videoIds.join(",")}&key=${YOUTUBE_API_KEY}`;
+    const detailsRes = await fetch(detailsUrl);
+    if (!detailsRes.ok) {
+      console.error(`[YOUTUBE TRENDING] videos.list failed: ${detailsRes.status} ${await detailsRes.text()}`);
+      return [];
+    }
+    const detailsData: any = await detailsRes.json();
+    return (detailsData.items || []).map((item: any) => ({
+      title: item.snippet?.title || "",
+      channelTitle: item.snippet?.channelTitle || "",
+      publishedAt: item.snippet?.publishedAt || "",
+      viewCount: item.statistics?.viewCount,
+      tags: item.snippet?.tags,
+      url: `https://www.youtube.com/watch?v=${item.id}`,
+    }));
+  } catch (err: any) {
+    console.error("[YOUTUBE TRENDING] Error:", err?.message || err);
+    return [];
+  }
+}
+
+function formatYouTubeTrendingForPrompt(videos: Awaited<ReturnType<typeof searchYouTubeTrending>>): string {
+  if (videos.length === 0) {
+    return "(No live YouTube trending data available — YOUTUBE_API_KEY not configured or no results found. Do not invent specific trending videos; rely on the research above and say the trending lookup was unavailable.)";
+  }
+  return videos
+    .map((v, i) => `${i + 1}. "${v.title}" — ${v.channelTitle}, ${v.viewCount ? `${v.viewCount} views` : "views n/a"}, published ${v.publishedAt.slice(0, 10)}${v.tags?.length ? `, tags: ${v.tags.slice(0, 8).join(", ")}` : ""} (${v.url})`)
+    .join("\n");
+}
+
+// FEATURE (YouTube optimization pipeline — deep-research + live trending
+// data, then video analysis): the user sends a reference video and wants
+// title/tags/description/hashtags back, grounded in what is actually
+// working on YouTube right now, from two independent real data sources:
+// Google-Search-grounded Deep Research, AND the live YouTube Data API
+// (see searchYouTubeTrending above) -- run in parallel since they're
+// unrelated calls, then both handed to Video Analysis as context alongside
+// the actual reference video.
+async function runVideoOptimizationPipeline(agentsAi: GoogleGenAI, taskDescription: string, attachment?: UploadedAttachment): Promise<string> {
+  console.log("[VIDEO PIPELINE] Stage 1/3 (deep research on current YouTube trends) starting");
+  const researchPromise = runSpecialistAgent(
+    agentsAi,
     "deep-research",
     `Research what is currently working on YouTube right now (as of today) — title phrasing patterns, tag strategy, description structure, and hashtag conventions — specifically relevant to this video/topic: ${taskDescription}`
   );
 
-  console.log("[VIDEO PIPELINE] Stage 2/2 (video analysis grounded in research) starting");
+  console.log("[VIDEO PIPELINE] Stage 2/3 (live YouTube trending data lookup) starting");
+  const trendingPromise = searchYouTubeTrending(taskDescription);
+
+  const [research, trendingVideos] = await Promise.all([researchPromise, trendingPromise]);
+  const trendingText = formatYouTubeTrendingForPrompt(trendingVideos);
+
+  console.log("[VIDEO PIPELINE] Stage 3/3 (video analysis grounded in research + live trending data) starting");
   const analysis = await runSpecialistAgent(
-    ai,
+    agentsAi,
     "video-analysis",
-    `${taskDescription}\n\nCurrent YouTube trend research to ground your suggestions in (from a separate Deep Research pass, not guessed):\n${research}\n\nAnalyze the attached reference video and produce, based on BOTH the actual video content above AND the trend research: (1) 3-5 optimized title options, (2) a tag list, (3) an optimized description, (4) a hashtag list.`,
+    `${taskDescription}\n\nCurrent YouTube trend research to ground your suggestions in (from a separate Deep Research pass, not guessed):\n${research}\n\nActual currently-trending YouTube videos on this topic from the last 10 days (real YouTube Data API results, not guessed):\n${trendingText}\n\nAnalyze the attached reference video (if one was supplied) and produce, based on the actual video content, the trend research, AND the live trending data above: (1) 3-5 optimized title options, (2) a tag list, (3) an optimized description, (4) a hashtag list. If the video has no audible speech and no on-screen text, base this on visuals only and say so explicitly.`,
     attachment
   );
 
@@ -1544,6 +1674,23 @@ wss.on("connection", async (clientWs, req) => {
     }
   });
 
+  // FEATURE (multi-provider / quota isolation): background specialist and
+  // pipeline calls (deep-research, live-research, video-analysis, video
+  // Files-API uploads) now go through this SEPARATE Gemini client, bound to
+  // GEMINI_API_KEY_AGENTS if set (falls back to the same key as `ai` if
+  // not). This means a quota-hungry background task can no longer take
+  // down the live voice conversation itself, which always uses `ai`
+  // directly. Coding specialist calls don't use either -- they go to
+  // Claude (see callClaudeCodingSpecialist).
+  const agentsAi = new GoogleGenAI({
+    apiKey: process.env.GEMINI_API_KEY_AGENTS || apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build'
+      }
+    }
+  });
+
   let liveSession: Session | null = null;
   let sessionReady = false;
   let sessionGeneration = 0; // bumped on every (re)connect attempt
@@ -1604,6 +1751,44 @@ wss.on("connection", async (clientWs, req) => {
     scaledWidth: number;
     scaledHeight: number;
   } | null = null;
+
+  // FEATURE (proactive screen-watching): while the user is screen-sharing,
+  // Aanya should be able to comment on her own, without being asked, for
+  // anything happening on screen -- not just video editing. Every incoming
+  // "image" frame (see the handler below) refreshes this; a frame older
+  // than PROACTIVE_FRAME_FRESHNESS_MS means screen-sharing is not currently
+  // active, so the watcher stays silent. lastProactiveCommentAt enforces a
+  // cooldown so it doesn't comment constantly.
+  let latestScreenFrame: { data: string; mimeType: string; timestamp: number } | null = null;
+  let lastProactiveCommentAt = 0;
+  const PROACTIVE_FRAME_FRESHNESS_MS = 20_000;
+  const PROACTIVE_COMMENT_COOLDOWN_MS = 60_000;
+  const PROACTIVE_CHECK_INTERVAL_MS = 15_000;
+
+  // FEATURE (proactive screen-watching): ticks every PROACTIVE_CHECK_INTERVAL_MS
+  // and only actually does anything when all three are true: screen-sharing
+  // is currently active (frame is fresh), the live session is ready to
+  // receive content, and the cooldown since the last proactive comment has
+  // elapsed. This never touches the main live conversation directly except
+  // to inject a labeled system note through the same sendClientContent path
+  // already used for delegateTask/attachment results below, so Aanya voices
+  // it naturally instead of it looking like a separate bot talking.
+  const proactiveWatchInterval = setInterval(async () => {
+    if (!liveSession || !sessionReady) return;
+    if (!latestScreenFrame) return;
+    if (Date.now() - latestScreenFrame.timestamp > PROACTIVE_FRAME_FRESHNESS_MS) return;
+    if (Date.now() - lastProactiveCommentAt < PROACTIVE_COMMENT_COOLDOWN_MS) return;
+
+    const frameToCheck = latestScreenFrame;
+    const comment = await checkProactiveScreenComment(agentsAi, frameToCheck);
+    if (comment && liveSession) {
+      lastProactiveCommentAt = Date.now();
+      liveSession.sendClientContent({
+        turns: `(Proactive observation — you noticed this on the user's screen yourself, without being asked. Mention it naturally, briefly, in your own voice: ${comment})`,
+        turnComplete: true
+      });
+    }
+  }, PROACTIVE_CHECK_INTERVAL_MS);
 
   // FIX (PC-wide click/scroll control): these three run only after the user
   // confirms on screen (same pattern as handleOpenWebsite/handleOpenApplication
@@ -2201,7 +2386,7 @@ wss.on("connection", async (clientWs, req) => {
                     } else if (call.name === "openFile") {
                       handleOpenFile(call, session, clientWs);
                     } else if (call.name === "delegateTask") {
-                      handleDelegateTask(call, session, clientWs, ai);
+                      handleDelegateTask(call, session, clientWs, agentsAi);
                     } else if (call.name === "startPcAccess") {
                       handleStartPcAccess(call, session, clientWs);
                     } else if (call.name === "stopPcAccess") {
@@ -2487,6 +2672,9 @@ wss.on("connection", async (clientWs, req) => {
               mimeType: dataObj.mimeType || "image/jpeg"
             }
           });
+          // FEATURE (proactive screen-watching): remember the latest frame
+          // so the periodic watcher below has something fresh to look at.
+          latestScreenFrame = { data: dataObj.image, mimeType: dataObj.mimeType || "image/jpeg", timestamp: Date.now() };
           if (Math.random() < 0.04) {
             console.log(`[STAGE 5 GEMINI VISION IN] Bytes Sent: ${dataObj.image.length} base64 chars | Mime: ${dataObj.mimeType || "image/jpeg"}`);
           }
@@ -2533,7 +2721,7 @@ wss.on("connection", async (clientWs, req) => {
                 if (!videoUpload) throw new Error("Video upload session expired before it could be analyzed.");
                 videoUpload.status = "processing";
                 videoUpload.updatedAt = Date.now();
-                const geminiFile = await uploadVideoToGemini(ai, videoUpload);
+                const geminiFile = await uploadVideoToGemini(agentsAi, videoUpload);
                 if (!geminiFile) throw new Error("Gemini could not ingest the uploaded video in time.");
                 videoUpload.status = "analyzing";
                 videoUpload.updatedAt = Date.now();
@@ -2541,9 +2729,9 @@ wss.on("connection", async (clientWs, req) => {
               }
               const rawAttachmentForModel = context.specialist === "video-analysis" || extensionOf(attachment.name) === "pdf" ? resolvedAttachment : undefined;
               const result =
-                context.specialist === "video-analysis" ? await runVideoOptimizationPipeline(ai, attachmentTask, rawAttachmentForModel) :
-                context.specialist === "coding" ? await runCodingPipeline(ai, attachmentTask, rawAttachmentForModel) :
-                await runSpecialistAgent(ai, context.specialist!, attachmentTask, rawAttachmentForModel);
+                context.specialist === "video-analysis" ? await runVideoOptimizationPipeline(agentsAi, attachmentTask, rawAttachmentForModel) :
+                context.specialist === "coding" ? await runCodingPipeline(attachmentTask) :
+                await runSpecialistAgent(agentsAi, context.specialist!, attachmentTask, rawAttachmentForModel);
               if (pendingUploadId) {
                 const videoUpload = videoUploads.get(pendingUploadId);
                 if (videoUpload) { videoUpload.status = "completed"; videoUpload.updatedAt = Date.now(); void removeVideoUpload(videoUpload); }
@@ -2648,6 +2836,7 @@ wss.on("connection", async (clientWs, req) => {
   clientWs.on("close", () => {
     console.log("Client WS disconnected");
     intentionalClose = true;
+    clearInterval(proactiveWatchInterval);
     sessionGeneration++; // invalidate any in-flight reconnect for this client
     if (liveSession) {
       try {
